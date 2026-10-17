@@ -84,6 +84,22 @@ bash scripts/run_ubuntu.sh /absolute/path/to/nuscenes
 
 # 변경 사항 설명
 
+## Ubuntu 실행 로그의 skip·예시 추론 오류 수정
+
+- `run_ubuntu.sh`와 `run_mac.sh` 모두 다운로드·이미지 복구 직후 공통 `prepare_inputs.py`를 자동 실행합니다. 별도 수동 복구 명령은 필요 없습니다.
+- 실행 폴더의 `input_repair_report.json`에 split별 통과 수, 설명 정규화 행, 복구 불가 행을 기록합니다. 원본 JSON·행 번호·분할은 유지하고 실제 학습 입력에서 동일한 정규화를 적용합니다. 반복 실행해도 복구 결과는 동일합니다.
+- 복구 불가 입력은 보고서를 저장하고 학습 전에 중단합니다. 빈 설명을 지어내거나 정답을 임의 수정하지 않습니다. Mac의 토큰 길이 검사는 이후 별도로 수행합니다.
+- Mac 전처리 plan에 형식 버전을 저장해 이전 캐시는 다시 만들고, 새 버전은 정상 재사용합니다. CUDA 예시 추론에서 예상하지 못한 오류가 나면 traceback과 함께 중단하여 전체 학습으로 넘어가지 않습니다.
+
+- 원본 `thinking`의 태그 밖 설명, 닫는 태그 누락, 반복 태그, `<thinkThe` 오타 때문에 제외되던 train 19개·validation 5개를 복구했습니다. 원문 JSON은 변경하지 않고, 설명·좌표·문장 순서를 보존한 채 학습 입력에서만 태그와 줄바꿈을 정규화합니다. 원문에 포함된 거절 문구나 설명의 사실성까지 교정하는 작업은 아닙니다.
+- 정답 및 생성 출력의 `<answer>` 검증은 그대로 엄격하게 유지합니다. 빈 설명이나 누락 이미지는 여전히 오류로 처리합니다.
+- 실제 5,280행 모두 Simple/Reason 형식·이미지 경로 검사 통과: train 4,218 / validation 534 / test 528. 토큰 길이·GPU 전체 학습 검증과는 별개이며 Mac 전처리에서는 길이 초과 행이 추가 제외될 수 있습니다. Mac의 이전 전처리 캐시는 자동 무효화합니다.
+- Arrow Dataset이 텍스트 항목에 추가한 `image=None` 때문에 예시 추론에서 발생하던 `NoneType ... startswith` 오류를 재현하고 수정했습니다. 추론 전 null 필드를 제거하며, 로컬 이미지 URI의 `%2B`·`%20`도 실제 경로로 복원합니다.
+- 예시 및 최종 test 추론에서 processor의 `images=`·`text=` 인자를 명시하고 chat template의 `tokenize=False`를 설정했습니다. 예시 추론 실패 시에는 전체 traceback을 남깁니다.
+- 회귀 테스트 19개 통과. 실제 설치된 Dataset/Qwen 이미지 처리기로 오류 재현 후 이미지 6장(각 224×224) 처리 성공을 확인했습니다. GPU 생성 완료는 컨테이너에서 미검증입니다.
+- 실행 중인 프로세스에는 반영되지 않습니다. 수정 적용은 기존 작업을 종료한 뒤 `bash scripts/run_ubuntu.sh`로 새 실행하며, 이전 학습을 이어받지는 않습니다.
+
+
 ## M4 MacBook Pro 16GB 대응
 
 - 기존 `scripts/vlm-finetuning.py`는 CUDA/Unsloth 기반이므로 Mac에서 그대로 사용하지 않음. NVIDIA용 코드는 유지.

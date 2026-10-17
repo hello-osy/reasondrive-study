@@ -55,6 +55,8 @@ if not torch.isfinite(y).all():
 print('CUDA / bitsandbytes 4bit 실행 확인')
 PY
 "$PYTHON" scripts/download_data.py --image_root "$IMAGE_ROOT"
+"$PYTHON" scripts/prepare_inputs.py --image_root "$IMAGE_ROOT" \
+  --split_path "$RUN_DIR/split_manifest.json" --report_path "$RUN_DIR/input_repair_report.json"
 COMMON=(--model_id "$MODEL_ID" --data_path data/drivelm.json
         --base_image_path "$IMAGE_ROOT" --split_path "$RUN_DIR/split_manifest.json"
         --epochs "$EPOCHS" --batch_size 1 --gradient_accumulation_steps 12

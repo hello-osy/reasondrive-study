@@ -39,6 +39,8 @@ RUN_DIR="outputs/mac_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 # JSON과 필요한 이미지 자동 다운로드·검증. 기존 파일은 재사용합니다.
 "$PYTHON" scripts/download_data.py --image_root "$IMAGE_ROOT"
+"$PYTHON" scripts/prepare_inputs.py --image_root "$IMAGE_ROOT" \
+  --split_path "splits/drivelm.json" --report_path "$RUN_DIR/input_repair_report.json"
 "$PYTHON" scripts/mac_pipeline.py prepare --image_root "$IMAGE_ROOT"
 # 첫 학습에서 모델 가중치 약 3.07 GB 다운로드. 두 모델은 캐시를 공유합니다.
 "$PYTHON" scripts/mac_pipeline.py train "$CHECKPOINT_OPTION" --mode reason --steps 12 --output_dir "$RUN_DIR/smoke"

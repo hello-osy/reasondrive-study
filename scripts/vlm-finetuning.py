@@ -14,7 +14,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Union, Any, Optional
 from datetime import datetime
-from data_utils import load_split, format_sample, write_json
+from data_utils import load_split, format_sample, write_json, clean_message_content
 
 from unsloth import FastVisionModel, is_bf16_supported
 from unsloth.trainer import UnslothVisionDataCollator
@@ -356,7 +356,7 @@ class QwenVLTrainer:
         
         try:
             # Get the first example from test dataset
-            example = self.val_dataset[0]
+            example = {"messages": clean_message_content(self.val_dataset[0]["messages"])}
             if 'Qwen' in self.config['model_id']:
                 # Import the vision processing utility
                 from qwen_vl_utils import process_vision_info
@@ -371,12 +371,12 @@ class QwenVLTrainer:
                     image_inputs.append(img)
             
             # Prepare input text
-            input_text = self.tokenizer.apply_chat_template([example["messages"][0]], add_generation_prompt=True)
+            input_text = self.tokenizer.apply_chat_template([example["messages"][0]], add_generation_prompt=True, tokenize=False)
             
             # Tokenize inputs
             inputs = self.tokenizer(
-                image_inputs,
-                input_text,
+                images=image_inputs,
+                text=input_text,
                 add_special_tokens=False,
                 return_tensors="pt",
             ).to("cuda" if torch.cuda.is_available() else "cpu")
@@ -400,8 +400,8 @@ class QwenVLTrainer:
             return generated_text
             
         except Exception as e:
-            logger.error(f"Error during inference: {str(e)}")
-            return None
+            logger.exception("Error during validation example inference")
+            raise
 
 def main():
     """Main function to run the training pipeline."""
