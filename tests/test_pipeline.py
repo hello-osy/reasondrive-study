@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from data_utils import load_split, format_sample, write_json, dataset_hash
+from data_utils import load_split, format_sample, write_json, dataset_hash, normalize_reasoning, clean_message_content
 from evaluate import compare, route_and_score, final_no_gpt, LANGUAGE_KEYS
 
 
@@ -80,7 +80,8 @@ class PipelineTests(unittest.TestCase):
         self.path.unlink()
         write_json(data, self.rows)
         scope = dict(os=__import__('os'), logger=logging.getLogger('test'),
-                     Dataset=types.SimpleNamespace(from_json=lambda p: json.loads(Path(p).read_text())),
+                     Dataset=types.SimpleNamespace(from_json=lambda p: json.loads(Path(p).read_text()),
+                                                  from_list=lambda rows: rows),
                      load_split=load_split, format_sample=format_sample, write_json=write_json)
         exec(compile(module, str(source), 'exec'), scope)
         trainer = types.SimpleNamespace(config={'data_path': str(data), 'split_path': str(self.path),
@@ -97,6 +98,31 @@ class PipelineTests(unittest.TestCase):
         row = dict(self.rows[0], thinking='<think>First</think>\n<think>Second</think>')
         formatted = format_sample(row, self.root, 'reason')
         self.assertIn('First\n\nSecond', formatted['messages'][1]['content'][0]['text'])
+
+    def test_source_reasoning_repairs_preserve_all_prose(self):
+        source = '<think>First</think>\\n\\nOutside <c1,CAM_FRONT,1,2>. <thinkThe last part'
+        text = normalize_reasoning(source)
+        self.assertEqual(text, 'First\n\nOutside <c1,CAM_FRONT,1,2>. The last part')
+        for source in ('<think>Unclosed', '<think>First<think>Second<think>'):
+            self.assertNotIn('<think', normalize_reasoning(source))
+        for source in ('', None, '<think></think>'):
+            with self.assertRaises(ValueError):
+                normalize_reasoning(source)
+        # Output answer parsing must remain strict.
+        from data_utils import tagged_text
+        with self.assertRaises(ValueError):
+            tagged_text('<answer>Unclosed', 'answer', required=True)
+
+    def test_arrow_null_image_fields_removed_without_mutation(self):
+        messages = [{'role': 'user', 'content': [
+            {'type': 'image', 'image': 'file:///tmp/a.jpg', 'text': None},
+            {'type': 'text', 'image': None, 'text': 'Question', 'resized_width': None}]}]
+        clean = clean_message_content(messages)
+        self.assertEqual(clean[0]['content'][1], {'type': 'text', 'text': 'Question'})
+        self.assertEqual(clean[0]['content'][0]['image'], '/tmp/a.jpg')
+        uri = [{'content': [{'type': 'image', 'image': 'file:///tmp/a%2Bb%20c.jpg'}]}]
+        self.assertEqual(clean_message_content(uri)[0]['content'][0]['image'], '/tmp/a+b c.jpg')
+        self.assertIn('image', messages[0]['content'][1])
 
     def test_graph_routing_and_no_gpt_formula(self):
         questions = ['Objects?', 'Is <c1,CAM_FRONT,10.0,20.0> a car?',

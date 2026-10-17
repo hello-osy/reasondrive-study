@@ -55,3 +55,6 @@ wandb/
 .cache/
 results/
 splits/
+
+# Generated Unsloth compilation cache
+unsloth_compiled_cache/

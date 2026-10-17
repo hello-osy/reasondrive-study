@@ -23,7 +23,7 @@ class MacOptimizationTests(unittest.TestCase):
             image.write_bytes(b'original')
             rows = [{'image': [str(image)]}]
             signature, newest = image_signature(rows, root)
-            expected = {'max_seq_length': 2048, 'dataset_sha256': 'data'}
+            expected = {'max_seq_length': 2048, 'dataset_sha256': 'data', 'reasoning_format_version': 2}
             manifest = {'indices': {'train': [0], 'validation': [1]}}
             plan = {**expected, 'usable': manifest['indices'],
                     'lengths': {mode: {'0': 10, '1': 20} for mode in ('simple', 'reason')}}
@@ -33,6 +33,12 @@ class MacOptimizationTests(unittest.TestCase):
             self.assertIsNotNone(reusable_plan(path, expected, manifest, signature, newest))
             self.assertIsNone(reusable_plan(path, {**expected, 'max_seq_length': 1024}, manifest, signature, newest))
             self.assertIsNone(reusable_plan(path, expected, {'indices': {'train': [2], 'validation': [1]}}, signature, newest))
+            plan['image_signature'] = signature
+            legacy = dict(plan)
+            legacy.pop('reasoning_format_version')
+            write_json(path, legacy)
+            self.assertIsNone(reusable_plan(path, expected, manifest, signature, newest))
+            write_json(path, plan)
             image.write_bytes(b'changed image bytes')
             changed, newest = image_signature(rows, root)
             self.assertNotEqual(changed, signature)

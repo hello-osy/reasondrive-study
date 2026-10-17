@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-from data_utils import load_split, format_sample, tagged_text, write_json
+from data_utils import load_split, format_sample, tagged_text, write_json, clean_message_content
 
 
 def evaluate_model(model_path, rows, manifest, base_image_path, output_file,
@@ -33,9 +33,10 @@ def evaluate_model(model_path, rows, manifest, base_image_path, output_file,
                   'answer': '', 'final_answer': '', 'status': 'error'}
         try:
             sample = format_sample(row, base_image_path, mode, training=False)
+            sample['messages'] = clean_message_content(sample['messages'])
             images, _ = process_vision_info(sample['messages'])
-            text = processor.apply_chat_template(sample['messages'], add_generation_prompt=True)
-            inputs = processor(images, text, add_special_tokens=False, return_tensors='pt').to(device)
+            text = processor.apply_chat_template(sample['messages'], add_generation_prompt=True, tokenize=False)
+            inputs = processor(images=images, text=text, add_special_tokens=False, return_tensors='pt').to(device)
             # Per-row seeding prevents a skipped example from shifting later sampled outputs.
             set_seed(seed + index)
             generation = {'max_new_tokens': max_new_tokens, 'do_sample': do_sample}
@@ -82,8 +83,13 @@ def main():
         parser.error('Specify --mode when saved training_config.json is unavailable')
     if config.get('mode') and mode != config['mode']:
         parser.error('--mode differs from the saved training mode')
-    from datasets import Dataset
-    rows = list(Dataset.from_json(args.data_path))
+    if config.get("max_steps", -1) > 0:
+        parser.error("Smoke-run adapters must not be used for final evaluation")
+    text = Path(args.data_path).read_text()
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     saved = json.loads(split_path.read_text())
     manifest = load_split(rows, split_path, saved['seed'], saved['val_size'], saved['test_size'])
     # When a local checkpoint has its own manifest, an override must agree with it.

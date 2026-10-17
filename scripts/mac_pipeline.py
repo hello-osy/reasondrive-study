@@ -110,7 +110,7 @@ def prepare(args):
     rows = read(data_path)
     manifest = load_split(rows, args.split_path, create=True)
     signature, newest_image = image_signature(rows, image_root)
-    expected = {'data_path': str(data_path.resolve()), 'image_root': str(image_root),
+    expected = {'reasoning_format_version': 2, 'data_path': str(data_path.resolve()), 'image_root': str(image_root),
                 'split_path': str(Path(args.split_path).resolve()), 'dataset_sha256': dataset_hash(rows),
                 'model_id': MODEL, 'revision': REVISION, 'max_seq_length': args.max_seq_length, 'seed': 3407}
     if not args.rebuild and reusable_plan(args.plan, expected, manifest, signature, newest_image):
@@ -145,7 +145,7 @@ def prepare(args):
     # Test must remain complete for official graph routing. Fail early on missing images.
     for index in tqdm(manifest['indices']['test'], desc='Check test images'):
         open_images(record(rows[index], image_root, 'simple', training=False)['images'])
-    plan = {'data_path': str(data_path.resolve()), 'image_root': str(image_root),
+    plan = {'reasoning_format_version': 2, 'data_path': str(data_path.resolve()), 'image_root': str(image_root),
             'split_path': str(Path(args.split_path).resolve()), 'dataset_sha256': dataset_hash(rows),
             'model_id': MODEL, 'revision': REVISION, 'max_seq_length': args.max_seq_length,
             'usable': usable, 'lengths': lengths, 'skipped': skipped, 'seed': 3407,

@@ -81,6 +81,46 @@ def tagged_text(text, tag, required=False):
     return text
 
 
+def normalize_reasoning(text):
+    """Normalize source annotations only; preserve prose, coordinates and ordering.
+
+    This is deliberately separate from strict generated-answer parsing. The source
+    contains mixed tagged/plain prose, unclosed tags and a '<thinkThe' typo.
+    """
+    text = str(text or '').replace('\\n', '\n').strip()
+    text = re.sub(r'<think(?=[A-Z])', '', text)
+    text = re.sub(r'</?think>', '\n\n', text)
+    text = re.sub(r'\n[ \t]*\n(?:[ \t]*\n)+', '\n\n', text).strip()
+    if not text:
+        raise ValueError('Empty think')
+    if re.search(r'</?think', text):
+        raise ValueError('Unrecognized thinking tag')
+    return text
+
+
+def clean_message_content(messages):
+    """Remove Arrow's null union fields before Qwen detects image entries."""
+    from urllib.parse import urlsplit, unquote
+    cleaned = []
+    for message in messages:
+        message = dict(message)
+        if isinstance(message.get('content'), list):
+            parts = []
+            for part in message['content']:
+                part = {k: v for k, v in part.items() if v is not None}
+                image = part.get('image')
+                if isinstance(image, str) and image.startswith('file://'):
+                    uri = urlsplit(image)
+                    if uri.netloc not in ('', 'localhost'):
+                        raise ValueError('Expected a local image URI')
+                    part['image'] = unquote(uri.path)
+                parts.append(part)
+            message['content'] = parts
+        cleaned.append(message)
+    return cleaned
+
+
+
 def format_sample(row, base_image_path, mode, training=True):
     if mode not in ('simple', 'reason'):
         raise ValueError('mode must be simple or reason')
@@ -102,7 +142,7 @@ def format_sample(row, base_image_path, mode, training=True):
     messages = [{'role': 'user', 'content': content}]
     if training:
         # Validate reasoning for BOTH modes so their eligible training rows stay identical.
-        thinking = tagged_text(row.get('thinking'), 'think')
+        thinking = normalize_reasoning(row.get('thinking'))
         answer = tagged_text(row.get('solution'), 'answer')
         completion = f'<answer>{answer}</answer>'
         if mode == 'reason':
