@@ -1,0 +1,18 @@
+# Install with uv --torch-backend=auto so RTX 50 gets a Blackwell-capable wheel.
+# The resolved versions are recorded per run; this file is not a tested lockfile.
+unsloth
+trl>=0.15
+transformers>=4.51
+torch>=2.7
+torchvision
+bitsandbytes>=0.46
+accelerate
+datasets
+pillow
+matplotlib
+tqdm
+wandb
+qwen-vl-utils
+huggingface-hub
+gdown==5.2.0
+-r requirements-eval.txt

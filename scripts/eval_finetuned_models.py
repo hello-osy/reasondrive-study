@@ -82,8 +82,13 @@ def main():
         parser.error('Specify --mode when saved training_config.json is unavailable')
     if config.get('mode') and mode != config['mode']:
         parser.error('--mode differs from the saved training mode')
-    from datasets import Dataset
-    rows = list(Dataset.from_json(args.data_path))
+    if config.get("max_steps", -1) > 0:
+        parser.error("Smoke-run adapters must not be used for final evaluation")
+    text = Path(args.data_path).read_text()
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     saved = json.loads(split_path.read_text())
     manifest = load_split(rows, split_path, saved['seed'], saved['val_size'], saved['test_size'])
     # When a local checkpoint has its own manifest, an override must agree with it.

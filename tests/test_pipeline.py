@@ -80,7 +80,8 @@ class PipelineTests(unittest.TestCase):
         self.path.unlink()
         write_json(data, self.rows)
         scope = dict(os=__import__('os'), logger=logging.getLogger('test'),
-                     Dataset=types.SimpleNamespace(from_json=lambda p: json.loads(Path(p).read_text())),
+                     Dataset=types.SimpleNamespace(from_json=lambda p: json.loads(Path(p).read_text()),
+                                                  from_list=lambda rows: rows),
                      load_split=load_split, format_sample=format_sample, write_json=write_json)
         exec(compile(module, str(source), 'exec'), scope)
         trainer = types.SimpleNamespace(config={'data_path': str(data), 'split_path': str(self.path),

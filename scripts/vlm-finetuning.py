@@ -110,6 +110,10 @@ def parse_args():
     parser.add_argument("--wandb_run_name", type=str, default=DEFAULT_CONFIG["wandb_run_name"],
                         help="Weights & Biases run name (defaults to timestamp if not provided)")
     
+    parser.add_argument("--exact_output_dir", action="store_true",
+                        help="Use output_dir directly (must be empty)")
+    parser.add_argument("--max_steps", type=int, default=-1,
+                        help="Optimizer steps; positive values are smoke runs, not final models")
     return parser.parse_args()
 
 class QwenVLTrainer:
@@ -140,6 +144,13 @@ class QwenVLTrainer:
         data_name = Path(config["data_path"]).stem
         self.output_dir = Path(config["output_dir"]) / f"{model_name}_{config['mode']}_{data_name}_{timestamp}"
         
+        if config["exact_output_dir"]:
+            self.output_dir = Path(config["output_dir"])
+        if self.output_dir.exists() and any(self.output_dir.iterdir()):
+            raise ValueError(f"Output directory must be empty: {self.output_dir}")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA GPU is required; check nvidia-smi and the PyTorch CUDA wheel")
+
         # Initialize wandb if enabled
         if config["use_wandb"]:
             wandb_run_name = config["wandb_run_name"] or f"{model_name}_{config['mode']}_{data_name}_{timestamp}"
@@ -221,7 +232,7 @@ class QwenVLTrainer:
                 except (KeyError, ValueError, TypeError, OSError) as error:
                     skipped.append({"index": index, "split": name, "error": str(error)})
                     logger.warning("Skipping %s row %s: %s", name, index, error)
-            setattr(self, attribute, formatted)
+            setattr(self, attribute, Dataset.from_list(formatted))
         write_json(self.output_dir / "skipped_samples.json", skipped)
         if not self.train_dataset or not self.val_dataset:
             raise ValueError("No usable training or validation samples; inspect skipped_samples.json")
@@ -244,15 +255,18 @@ class QwenVLTrainer:
         
         self.trainer = SFTTrainer(
             model=self.model,
-            tokenizer=self.tokenizer,
-            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=self.config["max_seq_length"]),  # Required for vision models
+            processing_class=self.tokenizer,
+            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=self.config["max_seq_length"], resize=(224, 224)),  # Bound six-image memory
             train_dataset=self.train_dataset,
             eval_dataset=self.val_dataset,
             args=SFTConfig(
                 per_device_train_batch_size=self.config["batch_size"],
                 gradient_accumulation_steps=self.config["gradient_accumulation_steps"],
-                warmup_steps=self.config["warmup_steps"],
+                warmup_steps=0 if self.config["max_steps"] > 0 else self.config["warmup_steps"],
                 num_train_epochs=self.config["epochs"],
+                max_steps=self.config["max_steps"],
+                per_device_eval_batch_size=1,
+                prediction_loss_only=True,
                 learning_rate=self.config["learning_rate"],
                 fp16=not is_bf16_supported(),
                 bf16=is_bf16_supported(),
@@ -276,21 +290,19 @@ class QwenVLTrainer:
                 dataset_text_field="",
                 dataset_kwargs={"skip_prepare_dataset": True},
                 dataset_num_proc=4,
-                max_seq_length=self.config["max_seq_length"],
+                max_length=self.config["max_seq_length"],
                 
                 # Evaluation and saving strategies must match for load_best_model_at_end
-                evaluation_strategy="steps",  # Match with save_strategy
-                eval_steps=self.config["eval_steps"],
-                save_strategy="steps", 
-                save_steps=self.config["save_steps"],
+                eval_strategy="no" if self.config["max_steps"] > 0 else "epoch",
+                save_strategy="no" if self.config["max_steps"] > 0 else "epoch",
                 save_total_limit=self.config["save_total_limit"],
                 
                 # Early stopping - save best model
-                load_best_model_at_end=True,
+                load_best_model_at_end=self.config["max_steps"] <= 0,
                 metric_for_best_model="eval_loss",
                 greater_is_better=False,
             ),
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+            callbacks=[] if self.config["max_steps"] > 0 else [EarlyStoppingCallback(early_stopping_patience=2)],
         )
     
     def train(self):
@@ -307,6 +319,8 @@ class QwenVLTrainer:
             # Save the model
             logger.info(f"Saving model to {self.output_dir}")
             self.trainer.save_model(str(self.output_dir))
+            self.tokenizer.save_pretrained(str(self.output_dir))
+            write_json(self.output_dir / "completed.json", {"smoke": self.config["max_steps"] > 0})
             
             # Log model metadata to wandb if enabled
             if self.config["use_wandb"]:
@@ -397,6 +411,8 @@ def main():
     # Add to config dictionary
     config = {
         "model_id": args.model_id,
+        "exact_output_dir": args.exact_output_dir,
+        "max_steps": args.max_steps,
         "mode": args.mode,
         "split_path": args.split_path,
         "val_size": args.val_size,
