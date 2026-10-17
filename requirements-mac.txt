@@ -1,0 +1,8 @@
+mlx-vlm[train]==0.7.8
+-r requirements-eval.txt
+# Transformers Qwen image/video processors import these; training still runs on MLX.
+torch==2.14.1
+torchvision==0.29.1
+mlx==0.32.4
+transformers==5.20.1
+gdown==5.2.0

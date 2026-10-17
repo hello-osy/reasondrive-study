@@ -14,6 +14,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Union, Any, Optional
 from datetime import datetime
+from data_utils import load_split, format_sample, write_json
 
 from unsloth import FastVisionModel, is_bf16_supported
 from unsloth.trainer import UnslothVisionDataCollator
@@ -99,7 +100,10 @@ def parse_args():
                         help="Maximum sequence length")
     parser.add_argument("--test_size", type=float, default=DEFAULT_CONFIG["test_size"],
                         help="Proportion of the dataset to use for testing")
-    parser.add_argument("--use_wandb", action="store_true", default=DEFAULT_CONFIG["use_wandb"],
+    parser.add_argument("--mode", choices=["simple", "reason"], default="reason")
+    parser.add_argument("--split_path", default="splits/drivelm.json")
+    parser.add_argument("--val_size", type=float, default=0.1)
+    parser.add_argument("--use_wandb", action=argparse.BooleanOptionalAction, default=DEFAULT_CONFIG["use_wandb"],
                         help="Whether to use Weights & Biases for logging")
     parser.add_argument("--wandb_project", type=str, default=DEFAULT_CONFIG["wandb_project"],
                         help="Weights & Biases project name")
@@ -122,7 +126,7 @@ class QwenVLTrainer:
         self.model = None
         self.tokenizer = None
         self.train_dataset = None
-        self.test_dataset = None
+        self.val_dataset = None
         self.trainer = None
         
         # Set seed for reproducibility
@@ -134,11 +138,11 @@ class QwenVLTrainer:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = config["model_id"].split('/')[-1]
         data_name = Path(config["data_path"]).stem
-        self.output_dir = Path(config["output_dir"]) / f"{model_name}_{data_name}_{timestamp}"
+        self.output_dir = Path(config["output_dir"]) / f"{model_name}_{config['mode']}_{data_name}_{timestamp}"
         
         # Initialize wandb if enabled
         if config["use_wandb"]:
-            wandb_run_name = config["wandb_run_name"] or f"{model_name}_{data_name}_{timestamp}"
+            wandb_run_name = config["wandb_run_name"] or f"{model_name}_{config['mode']}_{data_name}_{timestamp}"
             logger.info(f"Initializing Weights & Biases with project: {config['wandb_project']}, run: {wandb_run_name}")
             wandb.init(
                 project=config["wandb_project"],
@@ -202,113 +206,28 @@ class QwenVLTrainer:
         dataset = Dataset.from_json(self.config["data_path"])
         logger.info(f"Dataset loaded with {len(dataset)} samples")
         
-        # Split dataset
-        splits = dataset.train_test_split(test_size=self.config["test_size"], seed=self.config["seed"])
-        raw_train_dataset, raw_test_dataset = splits["train"], splits["test"]
-        
-        logger.info(f"Processing {len(raw_train_dataset)} training samples...")
-        self.train_dataset = [self._format_sample(example) for example in tqdm(raw_train_dataset)]
-        
-        logger.info(f"Processing {len(raw_test_dataset)} test samples...")
-        self.test_dataset = [self._format_sample(example) for example in tqdm(raw_test_dataset)]
-        
-        logger.info(f"Prepared {len(self.train_dataset)} training samples and "
-                   f"{len(self.test_dataset)} test samples")
-    
-    def _fix_image_paths(self, image_paths: Union[str, List[str]]) -> List[str]:
-        """
-        Fix image paths by converting relative paths to absolute paths.
-        
-        Args:
-            image_paths: Single image path or list of image paths
-            
-        Returns:
-            List of fixed image paths
-        """
-        # Ensure we have a list
-        if not isinstance(image_paths, list):
-            image_paths = [image_paths]
-        
-        # Fix each path
-        fixed_paths = []
-        for path in image_paths:
-            fixed_path = path.replace("../nuscenes", self.config["base_image_path"])
-            
-            # Convert to absolute path if it's not already
-            if not os.path.isabs(fixed_path):
-                fixed_path = os.path.abspath(fixed_path)
-            
-            # Check if the file exists
-            if os.path.exists(fixed_path):
-                fixed_paths.append(fixed_path)
-            else:
-                logger.warning(f"Image not found: {fixed_path}")
-        
-        return fixed_paths
-    
-    def _format_sample(self, example: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Format a single example for the model.
-        
-        Args:
-            example: Raw example from the dataset
-            
-        Returns:
-            Formatted example in the proper structure for Qwen2.5-VL
-        """
-        try:
-            # Get image paths
-            image_paths = self._fix_image_paths(example["image"])
-            
-            # Skip if no valid images
-            if not image_paths:
-                logger.warning(f"No valid images found for example, skipping")
-                return None
-            
-            # Create the prompt
-            prompt = (
-                f"You are an AI assistant for autonomous driving. Analyze the scene and reason through driving decisions carefully.\n\n"
-                f"Analyze the following driving scenario and provide reasoning:\n\n"
-                f"{example['problem']}\n\n"
-                f"Put your reasoning within <think></think> tags and your final answer within <answer></answer> tags."
-            )
-            
-            # Get the thinking and solution
-            thinking = example.get("thinking", "").strip()
-            solution = example.get("solution", "").strip()
-            
-            # Combine thinking and solution for the completion
-            completion = f"{thinking}\n\n{solution}"
-            
-            # Create content list in the format expected by Qwen2.5-VL
-            content_list = []
-            
-            # Add all images first
-            for img_path in image_paths:
-                content_list.append({
-                    "type": "image", 
-                    "image": "file://" + img_path, 
-                    'resized_height': 224,  # 5*28 (smaller height)
-                    'resized_width': 224    # 9*28 (smaller width, maintains ~16:9 ratio)
-                })
-            
-            # Add text prompt
-            content_list.append({"type": "text", "text": prompt})
-            
-            # Format in the messages format for Qwen2.5-VL
-            processed_example = {
-                'messages': [
-                    {"role": "user", "content": content_list},
-                    {"role": "assistant", "content": [{"type": "text", "text": completion}]},
-                ]
-            }
-            
-            return processed_example
-            
-        except Exception as e:
-            logger.error(f"Error processing example: {str(e)}")
-            return None
-    
+        rows = list(dataset)
+        manifest = load_split(rows, self.config["split_path"], self.config["seed"],
+                              self.config["val_size"], self.config["test_size"], create=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(self.output_dir / "split_manifest.json", manifest)
+        write_json(self.output_dir / "training_config.json", self.config)
+        skipped = []
+        for name, attribute in [("train", "train_dataset"), ("validation", "val_dataset")]:
+            formatted = []
+            for index in manifest["indices"][name]:
+                try:
+                    formatted.append(format_sample(rows[index], self.config["base_image_path"], self.config["mode"]))
+                except (KeyError, ValueError, TypeError, OSError) as error:
+                    skipped.append({"index": index, "split": name, "error": str(error)})
+                    logger.warning("Skipping %s row %s: %s", name, index, error)
+            setattr(self, attribute, formatted)
+        write_json(self.output_dir / "skipped_samples.json", skipped)
+        if not self.train_dataset or not self.val_dataset:
+            raise ValueError("No usable training or validation samples; inspect skipped_samples.json")
+        logger.info("Prepared %s training and %s validation samples; independent test untouched",
+                    len(self.train_dataset), len(self.val_dataset))
+
     # Add early stopping callback
     def setup_trainer(self):
         """Set up the SFT Trainer for fine-tuning."""
@@ -326,9 +245,9 @@ class QwenVLTrainer:
         self.trainer = SFTTrainer(
             model=self.model,
             tokenizer=self.tokenizer,
-            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=4096),  # Required for vision models
+            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=self.config["max_seq_length"]),  # Required for vision models
             train_dataset=self.train_dataset,
-            eval_dataset=self.test_dataset,
+            eval_dataset=self.val_dataset,
             args=SFTConfig(
                 per_device_train_batch_size=self.config["batch_size"],
                 gradient_accumulation_steps=self.config["gradient_accumulation_steps"],
@@ -423,7 +342,7 @@ class QwenVLTrainer:
         
         try:
             # Get the first example from test dataset
-            example = self.test_dataset[0]
+            example = self.val_dataset[0]
             if 'Qwen' in self.config['model_id']:
                 # Import the vision processing utility
                 from qwen_vl_utils import process_vision_info
@@ -457,12 +376,11 @@ class QwenVLTrainer:
                 streamer=text_streamer,
                 max_new_tokens=128,
                 use_cache=True,
-                temperature=1.5,
-                min_p=0.1
+                do_sample=False
             )
             
             # Get and return the generated text
-            generated_text = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+            generated_text = self.tokenizer.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
             logger.info(f"Generated response: {generated_text}")
             
             return generated_text
@@ -479,6 +397,9 @@ def main():
     # Add to config dictionary
     config = {
         "model_id": args.model_id,
+        "mode": args.mode,
+        "split_path": args.split_path,
+        "val_size": args.val_size,
         "data_path": args.data_path,
         "base_image_path": args.base_image_path,
         "output_dir": args.output_dir,

@@ -48,6 +48,16 @@ This dataset enhances the original DriveLM benchmark with structured reasoning c
 
 Please refer to [DriveLM dataset](https://github.com/OpenDriveLab/DriveLM/tree/main/challenge#how-to-prepare-data) to prepare the dataset.
 
+## Apple Silicon (M4 / 16GB)
+
+Use the MLX workflow in [OSY_CHANGED.md](OSY_CHANGED.md). The existing Unsloth training script requires a CUDA environment.
+
+```bash
+bash scripts/run_mac.sh
+```
+
+The script automatically downloads the QA JSON and required nuScenes images from official mirrors, verifies them, prepares shared splits, runs a memory smoke test, trains Simple and Reason sequentially, and generates GPT-free comparison tables. Existing data is reused. If both official mirrors require authorization or exceed download quotas, it stops with authentication instructions. Full 3B training on 16GB is not yet runtime-verified.
+
 ## Installation
 
 ```bash
@@ -132,8 +142,9 @@ python scripts/eval_finetuned_models.py \
     --data_path "drivelm_with_thinking_800_frames_clean.json" \
     --base_image_path "/path/to/nuscenes" \
     --output_path "results/qwen2.5-3b-reason_responses.json" \
-    --test_size 0.1 \
-    --seed 3047
+    --split_path "outputs_Qwen2.5-VL-3B-Instruct/RUN/split_manifest.json" \
+    --mode reason \
+    --seed 3407
 ```
 
 This script:
@@ -142,15 +153,16 @@ This script:
 - Generates responses with reasoning and answers
 - Saves responses in JSON format for subsequent metric calculation
 
-### Stage 2: Comprehensive Metrics Calculation
+### Stage 2: DriveLM metrics without GPT
 
-We then use the DriveLM evaluation framework to calculate multiple metrics:
+See [Simple / Reason comparison](OSY_CHANGED.md) for setup and the shared scene-disjoint train/validation/test protocol.
 
 ```bash
-python scripts/evaluation.py \
-    --root_path1 "results/qwen2.5-3b-reason_responses.json" \
-    --root_path2 "drivelm_with_thinking_800_frames_clean.json"
+pip install -r requirements-eval.txt
+python scripts/evaluate.py --responses simple=results/simple.json reason=results/reason.json --data_path drivelm_with_thinking_800_frames_clean.json
 ```
+
+Requires Java for official PTB tokenization. Outputs Accuracy, BLEU-1/2/3/4, ROUGE-L, CIDEr, Match_noGPT and Final_noGPT tables (Markdown/CSV/JSON), using original QA tags and graph filtering. No GPT API calls. Original Match itself includes GPT, so Match_noGPT uses only coordinate F1; Final_noGPT renormalizes the remaining components. These two columns are explicitly different from the paper's full scores. Local auxiliary exact-match/token-F1/format-rate columns were removed.
 
 ## Results
 

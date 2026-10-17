@@ -49,3 +49,9 @@ wandb/
 # OS specific
 .DS_Store
 
+
+.venv*/
+
+.cache/
+results/
+splits/
