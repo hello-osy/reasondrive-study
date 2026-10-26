@@ -1,0 +1,13 @@
+{
+  "_comment": "[논문 기반 재구현] Table 1/3.1의 GPT-4o teacher. [실험용 확장·설정 변경] REST API 및 운영 설정은 재구현 선택이며 논문에 없는 세부사항이다. 모델 접근 가능 여부는 실행 시 확인하며 다른 모델로 자동 대체하지 않는다. API 키는 OPENAI_API_KEY 환경변수만 사용한다.",
+  "provider": "openai",
+  "model": "gpt-4o",
+  "api_key_env": "OPENAI_API_KEY",
+  "max_output_tokens": 512,
+  "temperature": null,
+  "image_detail": "auto",
+  "timeout_seconds": 90,
+  "max_attempts": 3,
+  "retry_base_seconds": 1,
+  "max_request_bytes": 19000000
+}

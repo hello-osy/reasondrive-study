@@ -1,3 +1,7 @@
+# ============================================
+# 실험용 확장·설정 변경 — 파일 전체
+# 분할·입력·출력 처리를 공통화한 보조 모듈. 개별 변경의 근거는 아래에 표시한다.
+# ============================================
 """Shared, dependency-free data contract for paired Simple/Reason experiments."""
 import hashlib
 import json
@@ -17,6 +21,11 @@ def scene_id(row):
     return str(value)
 
 
+# ============================================
+# 공개 코드 오류 수정 — 해당 부분
+# 학습·평가에서 서로 다른 seed로 재분할하던 문제를 저장 manifest 재사용으로 해결.
+# 장면 단위 80/10/10 분할 자체는 C1을 위한 실험 설정이다.
+# ============================================
 def load_split(rows, path, seed=3407, val_size=0.1, test_size=0.1, create=False):
     """Persist exact row indices; reject changed data, settings, or leaking manifests."""
     path = Path(path)
@@ -65,7 +74,46 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+# ============================================
+# 논문 기반 재구현: 생성 답변 parser의 구조 검증 보완(재구현부 수정)
+# ============================================
+def generated_answer(text):
+    """재구현부 보완: 생성 답변의 균형·중복·중첩을 검사한다; 원문 복구와 분리."""
+    text = str(text or '').strip()
+    tokens = list(re.finditer(r'</?(?:think|answer)>', text))
+    stripped = re.sub(r'</?(?:think|answer)>', '', text)
+    if re.search(r'</?\s*(?:think|answer)\b', stripped):
+        raise ValueError('Malformed generated think/answer tag')
+    active, start, answer = None, None, None
+    cursor = 0
+    for token in tokens:
+        if active is None and text[cursor:token.start()].strip():
+            raise ValueError('Generated prose must be inside think/answer tags')
+        tag = token.group()
+        closing = tag.startswith('</')
+        name = tag[2:-1] if closing else tag[1:-1]
+        if not closing:
+            if active is not None or answer is not None:
+                raise ValueError('Nested, duplicate or misplaced generated answer/think tag')
+            active, start = name, token.end()
+        else:
+            if active != name:
+                raise ValueError('Unbalanced generated answer/think tags')
+            if name == 'answer':
+                answer = text[start:token.start()].strip()
+                if not answer:
+                    raise ValueError('Empty generated answer')
+            active = None
+        cursor = token.end()
+    if active is not None or answer is None or text[cursor:].strip():
+        raise ValueError('Expected one complete final <answer> pair')
+    return answer
+
+
 def tagged_text(text, tag, required=False):
+    # Existing inference callers keep their API; permissive source parsing stays separate.
+    if tag == 'answer' and required:
+        return generated_answer(text)
     text = str(text or '').strip()
     matches = re.findall(fr'<{tag}>(.*?)</{tag}>', text, re.S)
     if tag == 'think' and matches and all(part.strip() for part in matches):
@@ -81,6 +129,10 @@ def tagged_text(text, tag, required=False):
     return text
 
 
+# ============================================
+# 실험용 확장·설정 변경 — 해당 부분
+# 로컬 전처리에서 제외되던 원본 설명을 정규화한다. 생성 답변 복구에는 사용하지 않는다.
+# ============================================
 def normalize_reasoning(text):
     """Normalize source annotations only; preserve prose, coordinates and ordering.
 
@@ -121,6 +173,10 @@ def clean_message_content(messages):
 
 
 
+# ============================================
+# 논문 기반 재구현 — 해당 부분
+# 원본 Reason 입력 형식을 유지하면서 논문의 Simple 비교 모드를 추가했다.
+# ============================================
 def format_sample(row, base_image_path, mode, training=True):
     if mode not in ('simple', 'reason'):
         raise ValueError('mode must be simple or reason')

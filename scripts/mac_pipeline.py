@@ -1,4 +1,11 @@
-"""Apple Silicon MLX QLoRA: prepare, train, and generate held-out responses."""
+# ============================================
+# 실험용 확장·설정 변경: MLX 이식과 질문 토큰 학습 정책 변경
+# 논문 기반 재구현 / 공개 코드 오류 수정 부분은 아래에 구분한다.
+# ============================================
+"""실험용 확장·설정 변경: Apple Silicon MLX 이식 및 질문 토큰 학습 정책 변경.
+논문 기반 재구현: 동일 문항의 Instruct / Simple / Reason 비교.
+공개 코드 오류 수정: 독립 test/실패 행 보존. MLX optimizer는 CUDA와 다름을 기록한다.
+"""
 import argparse
 import json
 import math
@@ -6,9 +13,12 @@ import platform
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from data_utils import dataset_hash, format_sample, load_split, tagged_text, write_json
+from experiment_config import (DEFAULT_PATH, load_experiment, backend_settings, override_experiment,
+                               config_hash, resolve_model_source, runtime_metadata)
+from eval_finetuned_models import prompt_mode
 
-MODEL = 'mlx-community/Qwen2.5-VL-3B-Instruct-4bit'
-REVISION = '46d4cf06a06ffc1a766c214174f9cbed2f45bcab'
+_DEFAULT = backend_settings(load_experiment(), 'mlx')
+MODEL, REVISION = _DEFAULT['model_id'], _DEFAULT['model_revision']
 
 
 def read(path):
@@ -46,6 +56,9 @@ def open_images(paths):
     return images
 
 
+# ============================================
+# 실험용 확장·설정 변경: 이전 MLX completion-only에서 질문도 학습하도록 변경
+# ============================================
 def vision_dataset(records, model_config, processor):
     from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
     class ResizedDataset(VisionDataset):
@@ -53,7 +66,9 @@ def vision_dataset(records, model_config, processor):
             row = dict(self.dataset[index])
             row['images'] = open_images(row['images'])
             return self.process(row)
-    return ResizedDataset(records, model_config, processor, config={'train_on_completions': True})
+    # 이전 Mac completion-only에서 질문도 학습하도록 변경한다.
+    # MLX는 image placeholder도 loss에 포함하므로 CUDA의 image/pad mask와 동일하지 않다.
+    return ResizedDataset(records, model_config, processor, config={'train_on_completions': False})
 
 
 def image_signature(rows, image_root):
@@ -99,27 +114,31 @@ def evaluation_interval(train_size, accumulation, requested=0):
 
 
 def prepare(args):
-    mx = mac_runtime()
+    settings = backend_settings(args.experiment, 'mlx')
+    mx = mac_runtime(settings['seed'])
     image_root = Path(args.image_root).expanduser().resolve()
     if not (image_root / 'samples').is_dir():
         raise ValueError('image_root must contain nuScenes samples/CAM_* image directories')
     data_path = Path(args.data_path)
     if not data_path.exists():
-        from datasets import load_dataset
-        write_json(data_path, list(load_dataset('ac4462/DriveLM-reasoning', split='train')))
+        from download_data import annotations
+        annotations(data_path)  # 재현성: 공통 downloader의 QA_REVISION을 사용한다.
     rows = read(data_path)
-    manifest = load_split(rows, args.split_path, create=True)
+    manifest = load_split(rows, args.split_path, settings['seed'], settings['val_size'], settings['test_size'], create=True)
     signature, newest_image = image_signature(rows, image_root)
-    expected = {'reasoning_format_version': 2, 'data_path': str(data_path.resolve()), 'image_root': str(image_root),
+    expected = {'reasoning_format_version': 3, 'data_path': str(data_path.resolve()), 'image_root': str(image_root),
                 'split_path': str(Path(args.split_path).resolve()), 'dataset_sha256': dataset_hash(rows),
-                'model_id': MODEL, 'revision': REVISION, 'max_seq_length': args.max_seq_length, 'seed': 3407}
+                'model_id': settings['model_id'], 'revision': settings['model_revision'],
+                'max_seq_length': settings['max_seq_length'], 'seed': settings['seed'],
+                'experiment': args.experiment, 'experiment_sha256': config_hash(args.experiment),
+                'train_on_completions': False}
     if not args.rebuild and reusable_plan(args.plan, expected, manifest, signature, newest_image):
         print('Reusing validated mac_plan.json; skipped repeated image/token preprocessing')
         return
     # Only tokenizer/config files here; model weights are fetched by train.
     from huggingface_hub import snapshot_download
     from mlx_vlm.utils import load_processor
-    metadata_dir = snapshot_download(MODEL, revision=REVISION,
+    metadata_dir = snapshot_download(settings['model_id'], revision=settings['model_revision'],
                                     allow_patterns=['*.json', '*.txt', '*.model'])
     processor = load_processor(Path(metadata_dir))
     config = read(Path(metadata_dir) / 'config.json')
@@ -133,10 +152,10 @@ def prepare(args):
                 for mode in ('simple', 'reason'):
                     sample = vision_dataset([record(rows[index], image_root, mode)], config, processor)[0]
                     length = int(sample['input_ids'].size)
-                    if length > args.max_seq_length:
-                        raise ValueError(f'{mode}: {length} tokens exceeds {args.max_seq_length}; excluded in BOTH modes')
-                    if sample.get('pixel_values') is None or int(sample['completion_mask'].sum()) < 1:
-                        raise ValueError('Missing image features or answer supervision')
+                    if length > settings['max_seq_length']:
+                        raise ValueError(f'{mode}: {length} tokens exceeds {settings["max_seq_length"]}; excluded in BOTH modes')
+                    if sample.get('pixel_values') is None or length < 2:
+                        raise ValueError('Missing image features or training tokens')
                     lengths[mode][str(index)] = length
                 usable[split].append(index)
             except (ValueError, OSError, KeyError, TypeError) as error:
@@ -145,10 +164,7 @@ def prepare(args):
     # Test must remain complete for official graph routing. Fail early on missing images.
     for index in tqdm(manifest['indices']['test'], desc='Check test images'):
         open_images(record(rows[index], image_root, 'simple', training=False)['images'])
-    plan = {'reasoning_format_version': 2, 'data_path': str(data_path.resolve()), 'image_root': str(image_root),
-            'split_path': str(Path(args.split_path).resolve()), 'dataset_sha256': dataset_hash(rows),
-            'model_id': MODEL, 'revision': REVISION, 'max_seq_length': args.max_seq_length,
-            'usable': usable, 'lengths': lengths, 'skipped': skipped, 'seed': 3407,
+    plan = {**expected, 'usable': usable, 'lengths': lengths, 'skipped': skipped,
             'image_signature': signature}
     write_json(args.plan, plan)
     if not all(usable.values()):
@@ -159,6 +175,8 @@ def prepare(args):
 
 def inputs_from_plan(args):
     plan = read(args.plan)
+    if plan.get('experiment_sha256') != config_hash(args.experiment) or plan.get('train_on_completions') is not False:
+        raise ValueError('Prepared plan uses different conditions/loss policy; run prepare with the same --config')
     rows = read(plan['data_path'])
     if dataset_hash(rows) != plan['dataset_sha256']:
         raise ValueError('Dataset changed; prepare a new plan')
@@ -171,16 +189,20 @@ def inputs_from_plan(args):
 
 
 def train(args):
-    mx = mac_runtime()
+    settings = backend_settings(args.experiment, 'mlx')
+    mx = mac_runtime(settings['seed'])
     plan, rows, manifest = inputs_from_plan(args)
     out = Path(args.output_dir)
     if out.exists() and any(out.iterdir()):
         raise ValueError(f'Output is not empty: {out}; choose a fresh output directory')
+    from graph_context import load_graph_context
+    context = load_graph_context(plan['split_path'], rows, manifest)
     from mlx_vlm import load
     from mlx_vlm.trainer import Trainer, VLMTrainingArgs, prepare_model_for_training, TrainingCallback
     from mlx_vlm.trainer.common.utils import save_trainable_weights
-    model, processor = load(plan['model_id'], revision=plan['revision'])
-    prepare_model_for_training(model, lora_rank=8, lora_alpha=8, lora_dropout=0,
+    source_path, source = resolve_model_source(plan['model_id'], plan['revision'])
+    model, processor = load(source_path)
+    prepare_model_for_training(model, lora_rank=settings['lora_r'], lora_alpha=settings['lora_alpha'], lora_dropout=settings['lora_dropout'],
                                target_modules=['gate_proj', 'up_proj', 'down_proj'])
     datasets = {}
     for split in ('train', 'validation'):
@@ -192,22 +214,24 @@ def train(args):
         # Avoid reprocessing all images just to sort batches by sequence length.
         dataset.itemlen = lambda i, ids=indices: plan['lengths'][args.mode][str(ids[i])]
         datasets[split] = dataset
-    iters = args.steps if args.steps else math.ceil(len(datasets['train']) * args.epochs)
-    accumulation = min(12, iters)
+    iters = args.steps if args.steps else math.ceil(len(datasets['train']) * settings['epochs'])
+    accumulation = min(settings['gradient_accumulation_steps'], iters)
     eval_every = evaluation_interval(len(datasets['train']), accumulation, args.eval_every)
     cfg = VLMTrainingArgs(iters=iters, batch_size=1, gradient_accumulation_steps=accumulation,
-                          max_seq_length=plan['max_seq_length'], grad_checkpoint=args.grad_checkpoint,
-                          learning_rate=2e-4, weight_decay=0.01, optimizer='adamw',
-                          train_on_completions=True, cache_size=0, val_batches=-1 if not args.steps else 1,
+                          max_seq_length=plan['max_seq_length'], grad_checkpoint=settings['grad_checkpoint'],
+                          learning_rate=settings['learning_rate'], weight_decay=settings['weight_decay'], optimizer=settings['optimizer'],
+                          train_on_completions=False, cache_size=0, val_batches=-1 if not args.steps else 1,
                           steps_per_report=12, steps_per_eval=eval_every, steps_per_save=600,
                           adapter_file=str(out / 'last' / 'adapters.safetensors'),
                           clear_cache_threshold=256 * 1024**2)
     write_json(out / 'training_config.json', {**plan, 'mode': args.mode, 'iters': iters,
-               'epochs_requested': args.epochs, 'smoke_only': bool(args.steps), 'backend': 'mlx',
-               'optimizer': 'adamw', 'learning_rate': 2e-4, 'warmup': False, 'scheduler': 'constant',
-               'gradient_accumulation_steps': accumulation, 'train_on_completions': True,
-               'grad_checkpoint': args.grad_checkpoint, 'eval_every': eval_every})
+               'epochs_requested': settings['epochs'], 'smoke_only': bool(args.steps), 'backend': 'mlx',
+               'optimizer': settings['optimizer'], 'learning_rate': settings['learning_rate'], 'warmup': False, 'scheduler': 'constant',
+               'gradient_accumulation_steps': accumulation, 'train_on_completions': False,
+               'grad_checkpoint': settings['grad_checkpoint'], 'eval_every': eval_every,
+               'model_source': source, 'runtime': runtime_metadata('mlx')})
     write_json(out / 'split_manifest.json', manifest)
+    write_json(out / 'graph_context.json', context)
     class EarlyStop(Exception):
         pass
     class BestValidation(TrainingCallback):
@@ -227,7 +251,7 @@ def train(args):
                 write_json(out / 'best_validation.json', info)
             else:
                 self.stale += 1
-                if self.stale >= 2:
+                if self.stale >= settings['early_stopping_patience']:
                     raise EarlyStop()
     callback = BestValidation()
     trainer = Trainer(model, cfg, train_dataset=datasets['train'], eval_dataset=datasets['validation'],
@@ -240,51 +264,85 @@ def train(args):
                                        'best_val_loss': callback.best, 'smoke_only': bool(args.steps)})
 
 
+# ============================================
+# 논문 기반 재구현: 학습하지 않은 Instruct 기준선 추가
+# 실험용 확장·설정 변경: 동일 생성 조건/출처 기록 및 graph context 별도 추론
+# ============================================
 def infer(args):
-    mx = mac_runtime()
+    settings = backend_settings(args.experiment, 'mlx')
+    mx = mac_runtime(settings['seed'])
     plan, rows, manifest = inputs_from_plan(args)
-    run = Path(args.model_path)
-    config = read(run / 'training_config.json')
-    if config['smoke_only']:
-        raise ValueError('Smoke adapters cannot be used for the final comparison; run full training')
-    for key in ('dataset_sha256', 'model_id', 'revision', 'image_root', 'max_seq_length', 'usable', 'lengths'):
-        if plan[key] != config[key]:
-            raise ValueError(f'Training/plan mismatch: {key}')
-    if read(run / 'split_manifest.json') != manifest or not (run / 'completed.json').is_file():
-        raise ValueError('Missing completed run or incompatible test split')
+    run = None if args.instruct else Path(args.model_path)
+    if run is not None:
+        config = read(run / 'training_config.json')
+        if config['smoke_only']:
+            raise ValueError('Smoke adapters cannot be used for the final comparison; run full training')
+        for key in ('dataset_sha256', 'model_id', 'revision', 'image_root', 'max_seq_length', 'usable', 'lengths', 'experiment_sha256', 'train_on_completions'):
+            if plan[key] != config[key]:
+                raise ValueError(f'Training/plan mismatch: {key}')
+        source = config.get('model_source', {})
+        if source.get('resolved_revision') != plan['revision'] or source.get('processor_revision') != plan['revision'] or source.get('model_id') != plan['model_id']:
+            raise ValueError('Unverified training model/processor identity')
+        if read(run / 'split_manifest.json') != manifest or not (run / 'completed.json').is_file():
+            raise ValueError('Missing completed run or incompatible test split')
+        if read(run / 'completed.json').get('smoke_only', True):
+            raise ValueError('Smoke adapter is not a final model')
+        variant = config['mode']
+    else:
+        variant = 'instruct'
     from mlx_vlm import load, generate
     from mlx_vlm.prompt_utils import apply_chat_template
-    model, processor = load(plan['model_id'], revision=plan['revision'], adapter_path=str(run))
+    from data_utils import generated_answer
+    from graph_context import load_graph_context
+    context = load_graph_context(plan['split_path'], rows, manifest)
+    source_path, source = resolve_model_source(plan['model_id'], plan['revision'])
+    load_options = {'adapter_path': str(run)} if run is not None else {}
+    model, processor = load(source_path, **load_options)
     model.eval()
-    mode = config['mode']
+    mode = prompt_mode(variant)
+    budget = settings['max_new_tokens']
     write_json(args.output_path + '.meta.json', {
         'dataset_sha256': manifest['dataset_sha256'], 'test_indices': manifest['indices']['test'],
-        'split': 'test', 'mode': mode, 'model_path': str(run), 'seed': plan['seed'],
-        'max_new_tokens': args.max_new_tokens, 'do_sample': False, 'backend': 'mlx',
-        'model_id': plan['model_id'], 'revision': plan['revision'], 'image_size': 224})
-    results = []
-    from tqdm import tqdm
-    for index in tqdm(manifest['indices']['test'], desc=mode):
-        row = rows[index]
-        result = {'id': str(index), 'question': row['problem'], 'gt_answer': tagged_text(row['solution'], 'answer'),
-                  'answer': '', 'final_answer': '', 'status': 'error'}
+        'split': 'test', 'mode': variant, 'variant': variant, 'prompt_mode': mode,
+        'model_path': str(run) if run else plan['model_id'], 'seed': plan['seed'],
+        'max_new_tokens': budget, 'do_sample': False, 'backend': 'mlx',
+        'model_source': source, 'experiment_sha256': config_hash(args.experiment),
+        'experiment': args.experiment, 'runtime': runtime_metadata('mlx'),
+        'model_id': plan['model_id'], 'revision': plan['revision'], 'image_size': settings['image_size'],
+        'graph_context_sha256': context['sha256'],
+        'graph_context_path': str(Path(plan['split_path']).parent / 'graph_context.json')})
+
+    def predict(identifier, row, row_seed, scored):
+        result = {'id': str(identifier), 'question': row['problem'], 'gt_answer': tagged_text(row['solution'], 'answer'),
+                  'answer': '', 'final_answer': '', 'status': 'error', 'scored': scored}
         try:
             item = record(row, plan['image_root'], mode, training=False)
             prompt = apply_chat_template(processor, model.config, item['messages'], num_images=len(item['images']))
-            mx.random.seed(plan['seed'] + index)
+            mx.random.seed(row_seed)
             response = generate(model, processor, prompt=prompt, image=open_images(item['images']),
-                                max_tokens=args.max_new_tokens, temperature=0.0, verbose=False)
+                                max_tokens=budget, temperature=0.0, verbose=False)
             result['answer'] = response.text.strip()
+            count = getattr(response, 'generation_tokens', None)
+            result['generated_tokens'] = int(count) if count is not None else None
+            result['finish_reason'] = 'length' if count is not None and count >= budget else 'not_reported_by_backend'
             result['status'] = 'invalid_format'
-            result['final_answer'] = tagged_text(result['answer'], 'answer', required=True)
+            result['final_answer'] = generated_answer(result['answer'])
             result['status'] = 'ok'
         except Exception as error:
             result['error'] = str(error)
-        results.append(result)
+        mx.clear_cache()
+        return result
+
+    results = []
+    from tqdm import tqdm
+    for index in tqdm(manifest['indices']['test'], desc=variant):
+        results.append(predict(index, rows[index], plan['seed'] + index, True))
         if len(results) % 10 == 0:
             write_json(args.output_path, results)
-        mx.clear_cache()
     write_json(args.output_path, results)
+    context_results = [predict(item['id'], item, plan['seed'] + len(rows) + i, False)
+                       for i, item in enumerate(context['items'])]
+    write_json(args.output_path + '.context.json', {'graph_context': context, 'responses': context_results})
 
 
 def main():
@@ -294,24 +352,32 @@ def main():
     prep.add_argument('--image_root', required=True)
     prep.add_argument('--data_path', default='data/drivelm.json')
     prep.add_argument('--split_path', default='splits/drivelm.json')
-    prep.add_argument('--max_seq_length', type=int, default=2048)
+    prep.add_argument('--max_seq_length', type=int)
     prep.add_argument('--rebuild', action='store_true', help='Ignore cached preprocessing plan')
     tr = sub.add_parser('train')
     tr.add_argument('--mode', choices=['simple', 'reason'], required=True)
     tr.add_argument('--output_dir', required=True)
-    tr.add_argument('--epochs', type=int, default=3)
-    tr.add_argument('--grad_checkpoint', action=argparse.BooleanOptionalAction, default=True)
+    tr.add_argument('--epochs', type=int)
+    tr.add_argument('--grad_checkpoint', action=argparse.BooleanOptionalAction, default=None)
     tr.add_argument('--eval_every', type=int, default=0, help='Microsteps between full validations; 0 = once per epoch')
     tr.add_argument('--steps', type=int, default=0, help='Short smoke run; not usable for final evaluation')
     ev = sub.add_parser('infer')
-    ev.add_argument('--model_path', required=True)
+    ev.add_argument('--model_path')
+    ev.add_argument('--instruct', action='store_true', help='Pinned base model; no adapter or training')
     ev.add_argument('--output_path', required=True)
-    ev.add_argument('--max_new_tokens', type=int, default=512)
+    ev.add_argument('--max_new_tokens', type=int, help='Legacy option; must equal the shared config')
     for command in (prep, tr, ev):
         command.add_argument('--plan', default='data/mac_plan.json')
+        command.add_argument('--config', default=str(DEFAULT_PATH))
     args = parser.parse_args()
-    if args.command == 'train' and (args.epochs < 1 or args.steps < 0 or args.eval_every < 0):
-        parser.error('epochs must be positive; steps must be nonnegative')
+    args.experiment = override_experiment(load_experiment(args.config), 'mlx',
+                                         {key: getattr(args, key, None) for key in ('epochs', 'grad_checkpoint', 'max_seq_length')})
+    if args.command == 'train' and (args.steps < 0 or args.eval_every < 0):
+        parser.error('steps and eval_every must be nonnegative')
+    if args.command == 'infer' and bool(args.model_path) == bool(args.instruct):
+        parser.error('Choose either --model_path or --instruct')
+    if args.command == 'infer' and args.max_new_tokens is not None and args.max_new_tokens != args.experiment['common']['max_new_tokens']:
+        parser.error('--max_new_tokens must equal the shared --config value')
     {'prepare': prepare, 'train': train, 'infer': infer}[args.command](args)
 
 

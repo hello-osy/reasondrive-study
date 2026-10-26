@@ -1,0 +1,25 @@
+{
+  "date": "2026-10-26",
+  "scope": "Offline code validation only; no model training, model inference or paid API calls",
+  "unit_tests": {"passed": 50, "command": "python -m unittest discover -s tests -p 'test_*.py'"},
+  "python_syntax_files": 20,
+  "shell_syntax_files": ["scripts/run_mac.sh", "scripts/run_ubuntu.sh"],
+  "git_diff_check": "passed",
+  "readme_unchanged_from": "e38288ab3c59c02c1b28377ef27067c2b8104db6",
+  "offline_oracle_routing": {
+    "dataset_sha256": "4d5019cb583b73706eec82eef7640783a7526efd58b7295d17f8cfadfcec82e7",
+    "annotation_sha256": "ecd3c13e9beb27295bcf6182ea35fff7c1d6a9ba58d40e48fb38d713094759fd",
+    "test_indices_unchanged": true,
+    "scored_rows": 528,
+    "context_only_rows": 5,
+    "graph_excluded": 0,
+    "accuracy_eligible": 205,
+    "language_eligible": 75,
+    "coordinate_match_eligible": 27,
+    "gpt_only_omitted": 221,
+    "language_backend": "stub; these are routing checks, not measured model scores"
+  },
+  "generator_validation": {"mock_tests": 17, "cli_dry_run_valid_rows": 1, "camera_images": 6, "paid_api_calls": 0},
+  "word_report": {"file": "ReasonDrive_C1_구현_보고서.docx", "rendered_pages": 2, "both_pages_visually_reviewed": true},
+  "unverified": ["CUDA full training and inference", "MLX full training and inference", "Live provider access and generated reasoning quality", "Paper performance reproduction"]
+}

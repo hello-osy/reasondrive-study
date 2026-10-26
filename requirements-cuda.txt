@@ -1,3 +1,7 @@
+# ============================================
+# 실험용 확장·설정 변경: CUDA 의존성. 실기 검증된 lockfile은 아님.
+# DEPENDENCY_SNAPSHOT=이전 requirements-resolved.txt 로 같은 환경의 정확한 버전을 재설치한다.
+# ============================================
 # Install with uv --torch-backend=auto so RTX 50 gets a Blackwell-capable wheel.
 # The resolved versions are recorded per run; this file is not a tested lockfile.
 unsloth
@@ -7,6 +11,7 @@ torch>=2.7
 torchvision
 bitsandbytes>=0.46
 accelerate
+peft
 datasets
 pillow
 matplotlib

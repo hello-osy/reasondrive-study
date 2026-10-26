@@ -1,3 +1,7 @@
+# ============================================
+# 논문 기반 재구현 — 파일 전체
+# 공개되지 않은 평가기를 DriveLM tag·graph·공식 언어 지표에 따라 재구현.
+# ============================================
 """DriveLM tag/graph-routed metrics, with every GPT component removed."""
 import argparse
 import csv
@@ -9,6 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from data_utils import dataset_hash, tagged_text, write_json
 from vendor.drivelm_graph import DriveLMGraph
+from graph_context import root_index, validate_graph_context
 
 LANGUAGE_KEYS = ('Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'ROUGE_L', 'CIDEr')
 CATEGORIES = ('perception', 'prediction', 'planning', 'behavior')
@@ -26,6 +31,9 @@ def read_data(path):
 
 
 def final_no_gpt(accuracy, language, match):
+    # ============================================
+    # 실험용 확장·설정 변경: GPT 없는 별도 합성 점수
+    # ============================================
     if accuracy is None or match is None or any(language[k] is None for k in LANGUAGE_KEYS):
         return None
     # Original language aggregation; remaining 0.2 weights renormalized to 1/3.
@@ -46,7 +54,7 @@ def language_scores(predictions, references):
 
 
 def prediction_text(row):
-    if row.get('status') == 'error':
+    if row.get('status') in ('error', 'invalid_format'):
         return ''
     try:
         return tagged_text(row['answer'], 'answer', required=True)
@@ -54,7 +62,36 @@ def prediction_text(row):
         return ''
 
 
-def route_and_score(responses, data, language_backend=language_scores):
+def _context_predictions(context, responses, data):
+    if context is None:
+        return {}
+    payload = context['graph_context']
+    validate_graph_context(payload, data, payload['test_indices'])
+    if {str(i) for i in payload['test_indices']} != {row['id'] for row in responses}:
+        raise ValueError('Graph context and scored responses use different test rows')
+    expected = {item['id']: item for item in payload['items']}
+    actual = context['responses']
+    if len(actual) != len(expected) or {row['id'] for row in actual} != set(expected):
+        raise ValueError('Context responses must include every restored root, including failures')
+    result = {}
+    for response in actual:
+        item = expected[response['id']]
+        qa = item['metadata']['original_qa_pair']
+        if (response.get('scored') is not False or response['question'] != qa['Q']
+                or response['gt_answer'] != qa['A']):
+            raise ValueError('Context response differs from the original root annotation')
+        key = (item['metadata']['scene_id'], item['metadata']['frame_id'])
+        predicted = prediction_text(response)
+        result[key] = (predicted, qa['A'], response.get('status') != 'ok' or not predicted)
+    return result
+
+
+def route_and_score(responses, data, language_backend=language_scores, context=None):
+    # ============================================
+    # 논문 기반 재구현: 공식 graph/tag 유지; 재구현부의 누락 root 처리 보완
+    # ============================================
+    # 복원 root는 별도로 추론하며 원래 채점 분모에는 추가하지 않는다.
+    contexts = _context_predictions(context, responses, data)
     frames = defaultdict(list)
     for response in responses:
         index = int(response['id'])
@@ -75,17 +112,26 @@ def route_and_score(responses, data, language_backend=language_scores):
         frames[(metadata['scene_id'], metadata['frame_id'])].append(
             (CATEGORIES.index(category), index, qa, prediction_text(response)))
     accuracy, match, predictions, references = [], [], [], []
-    counts = dict(total=len(responses), graph_excluded=0, accuracy=0, language=0, match=0, gpt_only_omitted=0)
-    for entries in frames.values():
+    counts = dict(total=len(responses), graph_excluded=0, accuracy=0, language=0, match=0,
+                  gpt_only_omitted=0, context_only=len(contexts),
+                  context_failures=sum(item[2] for item in contexts.values()))
+    for frame_key, entries in frames.items():
         entries.sort(key=lambda item: (item[0], item[1]))
-        if entries[0][0] != 0:
-            raise ValueError('Each evaluated frame needs its initial perception QA for graph filtering')
+        root = root_index(data, [entry[1] for entry in entries])
         graph = DriveLMGraph()
-        for position, (_, index, qa, answer) in enumerate(entries):
+        if root is None:
+            if frame_key not in contexts:
+                raise ValueError(f'Frame {frame_key} needs a separately inferred original graph root; '
+                                 'run graph-context preflight and inference, without dropping test rows')
+            answer, truth, _ = contexts[frame_key]
+            graph.set_graph(answer, truth)
+        else:
+            first = next(entry for entry in entries if entry[1] == root)
+            graph.set_graph(first[3], first[2]['A'])
+            entries = [first] + [entry for entry in entries if entry[1] != root]
+        for _, index, qa, answer in entries:
             truth = qa['A']  # Official exact equality: no lowercasing or whitespace normalization.
-            if position == 0:
-                graph.set_graph(answer, truth)
-            elif not graph.eval_graph(qa['Q']):
+            if index != root and not graph.eval_graph(qa['Q']):
                 counts['graph_excluded'] += 1
                 continue
             tags = qa['tag']
@@ -109,6 +155,21 @@ def route_and_score(responses, data, language_backend=language_scores):
     return scores, counts
 
 
+def _experiment_conditions(meta):
+    keys = ('backend', 'image_size', 'model_source', 'experiment_sha256')
+    if not any(key in meta for key in keys):
+        return None  # Legacy synthetic fixtures and old complete-frame result files.
+    if any(key not in meta or meta[key] is None for key in keys):
+        raise ValueError('Comparison requires complete backend/image/model/experiment provenance')
+    source = meta['model_source']
+    source_keys = ('model_id', 'resolved_revision', 'processor_revision')
+    if not isinstance(source, dict) or any(not source.get(key) for key in source_keys):
+        raise ValueError('Comparison requires resolved model and processor revisions')
+    return {'backend': meta['backend'], 'image_size': meta['image_size'],
+            'experiment_sha256': meta['experiment_sha256'],
+            'model_source': {key: source[key] for key in source_keys}}
+
+
 def compare(paths, data, language_backend=language_scores):
     table, details, expected, expected_meta = [], {}, None, None
     fingerprint = dataset_hash(data)
@@ -117,6 +178,11 @@ def compare(paths, data, language_backend=language_scores):
             raise ValueError('Duplicate model label')
         rows = json.loads(Path(path).read_text())
         meta = json.loads(Path(str(path) + '.meta.json').read_text())
+        sidecar = Path(str(path) + '.context.json')
+        context = json.loads(sidecar.read_text()) if sidecar.is_file() else None
+        context_hash = context['graph_context']['sha256'] if context is not None else None
+        if meta.get('graph_context_sha256') != context_hash:
+            raise ValueError('Missing or mismatched graph context sidecar')
         ids = [row['id'] for row in rows]
         if not ids or len(ids) != len(set(ids)):
             raise ValueError('Empty results or duplicate IDs')
@@ -133,12 +199,19 @@ def compare(paths, data, language_backend=language_scores):
             raise ValueError('Incomplete test scenes: graph evaluation requires all QA rows')
         truth = {row['id']: (row['question'], row['gt_answer']) for row in rows}
         signature = {k: meta[k] for k in ('dataset_sha256', 'test_indices', 'split', 'seed', 'max_new_tokens', 'do_sample')}
+        signature['graph_context_sha256'] = context_hash
+        # ============================================
+        # 실험용 확장·설정 변경: Instruct/Simple/Reason의 동일 조건 검증
+        # ============================================
+        # Variant and prompt_mode intentionally differ; cache paths need not be identical.
+        signature['experiment_conditions'] = _experiment_conditions(meta)
         if meta['split'] != 'test':
             raise ValueError('Only independent test results may be compared')
         if expected is not None and (truth != expected or signature != expected_meta):
-            raise ValueError('Models must use identical test rows, references, and generation settings')
+            raise ValueError('Models must use identical test rows, references, generation settings, '
+                             'backend, image size, model/processor revisions and experiment settings')
         expected, expected_meta = truth, signature
-        scores, counts = route_and_score(rows, data, language_backend)
+        scores, counts = route_and_score(rows, data, language_backend, context=context)
         table.append({'model': label, **scores})
         details[label] = counts
     return table, details
@@ -156,6 +229,7 @@ def main():
     table, counts = compare(pairs, read_data(args.data_path))
     output = Path(args.output_dir)
     note = ('DriveLM graph/tag routing and official language backend. No GPT calls. '
+            'Restored original roots are inferred separately as graph context only; scored test rows are unchanged. '
             'Match_noGPT is coordinate F1 only (0-1). Final_noGPT=(Accuracy+Language+Match_noGPT)/3; '
             'these two columns differ from the original paper metrics. N/A means no eligible QA, not zero.')
     write_json(output / 'comparison.json', {'metric_scope': note, 'counts': counts, 'rows': table,

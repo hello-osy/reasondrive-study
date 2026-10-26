@@ -1,4 +1,9 @@
-"""Explicit Metal smoke test; uses tiny random weights, not a trained Qwen model."""
+# ============================================
+# 실험용 확장·설정 변경: 명시적으로 실행하는 소형 Metal 검증 도구
+# ============================================
+"""Tiny random-weight Metal smoke test; this is not trained Qwen validation.
+질문도 loss에 포함하는 MLX 설정을 점검한다. 자동 CPU 테스트에서는 실행하지 않는다.
+"""
 import sys
 import tempfile
 from pathlib import Path
@@ -51,7 +56,7 @@ with tempfile.TemporaryDirectory() as temp:
     mx.eval(before)
     samples = [{'input_ids': mx.array([1,2,3,4,5]), 'attention_mask':mx.ones((5,),dtype=mx.int32),
                 'completion_mask':mx.array([0,0,1,1,1]), 'pixel_values':mx.ones((6,3,4,4))}]
-    cfg = VLMTrainingArgs(iters=2, grad_checkpoint=True, train_on_completions=True,
+    cfg = VLMTrainingArgs(iters=2, grad_checkpoint=True, train_on_completions=False,
                           max_seq_length=64, gradient_accumulation_steps=2, val_batches=1,
                           steps_per_eval=2, steps_per_report=2, adapter_file=str(root/'adapters.safetensors'))
     trainer = Trainer(model,cfg,train_dataset=samples,eval_dataset=samples,prepared=True)
@@ -64,7 +69,7 @@ with tempfile.TemporaryDirectory() as temp:
     prepare_model_for_training(restored, checkpoint_path=root, verbose=False)
     restored_weights = dict(tree_flatten(restored.trainable_parameters()))
     assert all(bool(mx.all(after[k] == restored_weights[k])) for k in after)
-    print('PASS: Metal 4bit LoRA update, completion CE, checkpointing, validation, adapter round trip')
+    print('PASS: Metal 4bit LoRA update, full-sequence CE, checkpointing, validation, adapter round trip')
 
     from huggingface_hub import snapshot_download
     from mlx_vlm.utils import load_processor
@@ -80,6 +85,6 @@ with tempfile.TemporaryDirectory() as temp:
     sample=vision_dataset([row],config,processor)[0]
     assert sample['pixel_values'] is not None
     assert sample['image_grid_thw'].shape[0] == 6
-    assert int(sample['completion_mask'].sum()) > 0
-    assert int(sample['completion_mask'].sum()) < sample['input_ids'].size
-    print('PASS: real Qwen processor, 6 resized camera images, completion mask',sample['input_ids'].shape,sample['image_grid_thw'].tolist())
+    assert 'completion_mask' not in sample
+    assert int(sample['attention_mask'].sum()) > 0
+    print('PASS: real Qwen processor, 6 resized camera images, no completion-only mask',sample['input_ids'].shape,sample['image_grid_thw'].tolist())

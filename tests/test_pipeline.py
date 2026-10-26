@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from data_utils import load_split, format_sample, write_json, dataset_hash, normalize_reasoning, clean_message_content
 from evaluate import compare, route_and_score, final_no_gpt, LANGUAGE_KEYS
+from graph_context import ROOT_QUESTION, prepare_graph_context
 
 
 class PipelineTests(unittest.TestCase):
@@ -15,8 +16,9 @@ class PipelineTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.image = self.root / 'image.jpg'
         self.image.touch()
-        self.rows = [{'metadata': {'scene_id': str(i//2)}, 'image': [str(self.image)],
-                      'problem': f'Question {i}', 'thinking': '<think>Because</think>',
+        self.rows = [{'metadata': {'scene_id': str(i//2), 'frame_id': str(i), 'category': 'perception',
+                                  'original_qa_pair': {'Q': ROOT_QUESTION, 'A': 'Stop', 'tag': [2]}},
+                      'image': [str(self.image)], 'problem': ROOT_QUESTION, 'thinking': '<think>Because</think>',
                       'solution': '<answer>Stop</answer>'} for i in range(40)]
         self.path = self.root / 'splits' / 'split.json'
 
@@ -79,6 +81,8 @@ class PipelineTests(unittest.TestCase):
         self.rows[bad]['image'] = ['missing.jpg']
         self.path.unlink()
         write_json(data, self.rows)
+        prepared_split = load_split(self.rows, self.path, create=True)
+        prepare_graph_context(self.rows, prepared_split, self.path)
         scope = dict(os=__import__('os'), logger=logging.getLogger('test'),
                      Dataset=types.SimpleNamespace(from_json=lambda p: json.loads(Path(p).read_text()),
                                                   from_list=lambda rows: rows),
@@ -125,7 +129,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('image', messages[0]['content'][1])
 
     def test_graph_routing_and_no_gpt_formula(self):
-        questions = ['Objects?', 'Is <c1,CAM_FRONT,10.0,20.0> a car?',
+        questions = [ROOT_QUESTION, 'Is <c1,CAM_FRONT,10.0,20.0> a car?',
                      'Is <c2,CAM_FRONT,200.0,200.0> a car?', 'Next object?', 'Safe action?']
         answers = ['<c1,CAM_FRONT,10.0,20.0>', 'Yes.', 'Yes.', '<c1,CAM_FRONT,10.0,20.0>', 'Stop']
         tags = [[2], [0], [0], [3], [1]]
@@ -150,12 +154,10 @@ class PipelineTests(unittest.TestCase):
 
     def results(self):
         path = self.root / 'nested' / 'responses.json'
-        self.rows = [dict(self.rows[0], metadata={'scene_id': 'a', 'frame_id': 'f', 'category': 'perception', 'original_qa_pair': {'Q': 'Q', 'A': 'Stop', 'tag': [0, 2]}}),
-                     dict(self.rows[1], metadata={'scene_id': 'a', 'frame_id': 'g', 'category': 'perception', 'original_qa_pair': {'Q': 'Q2', 'A': 'Stop', 'tag': [0, 2]}})]
-        self.rows[0]['problem'] = 'Q'
-        self.rows[1]['problem'] = 'Q2'
-        rows = [{'id': '0', 'question': 'Q', 'gt_answer': 'Stop', 'answer': '<think>Go</think><answer>Stop</answer>', 'status': 'ok'},
-                {'id': '1', 'question': 'Q2', 'gt_answer': 'Stop', 'answer': '', 'status': 'error'}]
+        self.rows = [dict(self.rows[0], metadata={'scene_id': 'a', 'frame_id': 'f', 'category': 'perception', 'original_qa_pair': {'Q': ROOT_QUESTION, 'A': 'Stop', 'tag': [0, 2]}}),
+                     dict(self.rows[1], metadata={'scene_id': 'a', 'frame_id': 'g', 'category': 'perception', 'original_qa_pair': {'Q': ROOT_QUESTION, 'A': 'Stop', 'tag': [0, 2]}})]
+        rows = [{'id': '0', 'question': ROOT_QUESTION, 'gt_answer': 'Stop', 'answer': '<think>Go</think><answer>Stop</answer>', 'status': 'ok'},
+                {'id': '1', 'question': ROOT_QUESTION, 'gt_answer': 'Stop', 'answer': '', 'status': 'error'}]
         write_json(path, rows)
         write_json(str(path)+'.meta.json', {'test_indices': [0, 1], 'dataset_sha256': dataset_hash(self.rows),
                    'split': 'test', 'seed': 3407, 'max_new_tokens': 512, 'do_sample': False})
@@ -182,6 +184,37 @@ class PipelineTests(unittest.TestCase):
         write_json(str(second)+'.meta.json', json.loads(Path(str(path)+'.meta.json').read_text()))
         with self.assertRaises(ValueError):
             compare([('simple', path), ('reason', second)], self.rows, lambda p, r: {k: 0.0 for k in LANGUAGE_KEYS})
+
+    def test_comparison_checks_experiment_model_and_processor_conditions(self):
+        import copy
+        path, rows = self.results()
+        meta = json.loads(Path(str(path) + '.meta.json').read_text())
+        meta.update(backend='cuda', image_size=224, experiment_sha256='shared-config',
+                    model_source={'model_id': 'base', 'resolved_revision': 'model-snapshot',
+                                  'processor_revision': 'processor-snapshot', 'local_path': '/cache/a'})
+        write_json(str(path) + '.meta.json', meta)
+        second = self.root / 'second.json'
+        write_json(second, rows)
+        for field in ('backend', 'image_size', 'experiment_sha256', 'model_id',
+                      'resolved_revision', 'processor_revision'):
+            changed = copy.deepcopy(meta)
+            target = changed['model_source'] if field in changed['model_source'] else changed
+            target[field] = 'different'
+            write_json(str(second) + '.meta.json', changed)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                compare([('simple', path), ('reason', second)], self.rows,
+                        lambda p, r: {k: 0.0 for k in LANGUAGE_KEYS})
+        allowed = copy.deepcopy(meta)
+        allowed.update(mode='reason', prompt_mode='reason', variant='reason')
+        allowed['model_source']['local_path'] = '/another/cache'
+        write_json(str(second) + '.meta.json', allowed)
+        compare([('simple', path), ('reason', second)], self.rows,
+                lambda p, r: {k: 0.0 for k in LANGUAGE_KEYS})
+        allowed.pop('model_source')
+        write_json(str(second) + '.meta.json', allowed)
+        with self.assertRaisesRegex(ValueError, 'complete.*provenance'):
+            compare([('simple', path), ('reason', second)], self.rows,
+                    lambda p, r: {k: 0.0 for k in LANGUAGE_KEYS})
 
 
 if __name__ == '__main__':
