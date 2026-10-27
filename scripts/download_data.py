@@ -1,3 +1,8 @@
+# ============================================
+# 실험용 확장·설정 변경 — 파일 전체
+# 공개 데이터와 이미지를 자동 준비하고 출처·누락·손상을 기록하는 실행 보조 도구.
+# 논문 저자가 공개한 다운로드 구현은 아님.
+# ============================================
 """Download ReasonDrive annotations and required nuScenes images from official mirrors."""
 import argparse
 import json

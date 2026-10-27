@@ -1,0 +1,13 @@
+{
+  "_comment": "[실험용 확장·설정 변경] Gemini teacher는 원논문의 GPT-4o 재현과 별도 실험이다. model은 사용 가능한 Gemini 모델 ID로 명시적으로 바꾼다. 이 예시 이름의 계정별 이용 가능 여부는 검증하지 않았다. API 키는 GEMINI_API_KEY 환경변수만 사용한다. image_detail은 OpenAI 전용이며 Gemini에 전송되지 않는다.",
+  "provider": "gemini",
+  "model": "gemini-2.5-flash",
+  "api_key_env": "GEMINI_API_KEY",
+  "max_output_tokens": 512,
+  "temperature": null,
+  "image_detail": "auto",
+  "timeout_seconds": 90,
+  "max_attempts": 3,
+  "retry_base_seconds": 1,
+  "max_request_bytes": 19000000
+}

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Qwen 2.5VL Fine-tuning Script
------------------------------
-An efficient implementation for fine-tuning Qwen 2.5VL on autonomous driving data.
+# ============================================
+# 논문 기반 재구현 / 공개 코드 오류 수정 / 실험용 확장·설정 변경
+# 상세 분류는 아래 설명 및 해당 부분 주석에 기록한다.
+# ============================================
+"""논문 기반 재구현: 공개 원본의 Reason 학습을 유지하고 Simple 비교 모드를 추가한다.
+공개 코드 오류 수정: 저장 분할 재사용, 잘못된 입력/실패 처리.
+실험용 확장·설정 변경: 공통 설정, 고정 snapshot, 실행 출처, epoch별 검증.
 """
 
 import os
@@ -15,6 +18,8 @@ from pathlib import Path
 from typing import List, Dict, Union, Any, Optional
 from datetime import datetime
 from data_utils import load_split, format_sample, write_json, clean_message_content
+from experiment_config import (DEFAULT_PATH, load_experiment, backend_settings,
+                               override_experiment, config_hash, resolve_model_source, runtime_metadata)
 
 from unsloth import FastVisionModel, is_bf16_supported
 from unsloth.trainer import UnslothVisionDataCollator
@@ -38,10 +43,10 @@ logger = logging.getLogger(__name__)
 
 # Default configurations
 DEFAULT_CONFIG = {
-    "model_id": "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit",
+    "model_id": "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit",
     "data_path": "drivelm_with_thinking_800_frames_clean.json",
     "base_image_path": "../challenge/data/nuscenes",
-    "output_dir": "outputs_Qwen2.5-VL-7B-Instruct",
+    "output_dir": "outputs_Qwen2.5-VL-3B-Instruct",
     "epochs": 3,
     "batch_size": 1,
     "gradient_accumulation_steps": 12,
@@ -63,9 +68,19 @@ DEFAULT_CONFIG = {
     "wandb_run_name": None
 }
 
+# ============================================
+# 실험용 확장·설정 변경: 공통 설정을 CLI 기본값과 실행 기록의 원천으로 사용
+# ============================================
 def parse_args():
     """Parse command line arguments."""
+    preliminary = argparse.ArgumentParser(add_help=False)
+    preliminary.add_argument('--config', default=str(DEFAULT_PATH))
+    known, _ = preliminary.parse_known_args()
+    experiment = load_experiment(known.config)
+    settings = backend_settings(experiment, 'cuda')
     parser = argparse.ArgumentParser(description="Fine-tune Qwen 2.5VL for autonomous driving tasks")
+    parser.add_argument('--config', default=known.config)
+    parser.add_argument('--model_revision', help='Immutable revision; required when changing the model ID')
     
     parser.add_argument("--model_id", type=str, default=DEFAULT_CONFIG["model_id"],
                         help="Model ID to use for fine-tuning")
@@ -114,7 +129,12 @@ def parse_args():
                         help="Use output_dir directly (must be empty)")
     parser.add_argument("--max_steps", type=int, default=-1,
                         help="Optimizer steps; positive values are smoke runs, not final models")
-    return parser.parse_args()
+    parser.set_defaults(**{k: v for k, v in settings.items() if k != 'model_revision'})
+    args = parser.parse_args()
+    overrides = {k: getattr(args, k) for k in settings if hasattr(args, k)}
+    args.experiment = override_experiment(experiment, 'cuda', overrides)
+    args.model_revision = args.experiment['backends']['cuda']['model_revision']
+    return args
 
 class QwenVLTrainer:
     """Trainer class for fine-tuning Qwen 2.5VL models."""
@@ -161,21 +181,21 @@ class QwenVLTrainer:
                 config=config
             )
         
-        # Load model and tokenizer
-        self._load_model()
-        
-        # Log GPU information
-        if torch.cuda.is_available():
-            self._log_gpu_info()
+        # 실험용 확장·설정 변경: 로컬 입력·graph context 보완 검사가 끝난 뒤 가중치를 불러온다.
     
+    # ============================================
+    # 실험용 확장·설정 변경: 모델/processor의 고정 snapshot과 실제 실행 출처 기록
+    # 원본의 4bit·언어 MLP LoRA 학습 설정은 유지한다.
+    # ============================================
     def _load_model(self):
         """Load and prepare the model and tokenizer."""
         logger.info(f"Loading model: {self.config['model_id']}")
         
+        source_path, self.model_source = resolve_model_source(self.config['model_id'], self.config['model_revision'])
         self.model, self.tokenizer = FastVisionModel.from_pretrained(
-            self.config["model_id"],
+            source_path,
             load_in_4bit=True,  # Use 4bit quantization to reduce memory usage
-            use_gradient_checkpointing="unsloth",  # Enable gradient checkpointing for longer context
+            use_gradient_checkpointing="unsloth" if self.config['grad_checkpoint'] else False,
         )
         
         logger.info("Applying LoRA configuration")
@@ -193,6 +213,12 @@ class QwenVLTrainer:
             use_rslora=False,
             loftq_config=None,
         )
+        self.config['model_source'] = self.model_source
+        self.config['runtime'] = runtime_metadata('cuda')
+        self.config['actual_precision'] = 'bf16' if is_bf16_supported() else 'fp16'
+        self.config['trainable_parameters'] = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        write_json(self.output_dir / 'training_config.json', self.config)
+        self._log_gpu_info()
     
     def _log_gpu_info(self):
         """Log GPU information for monitoring."""
@@ -205,6 +231,10 @@ class QwenVLTrainer:
         else:
             logger.warning("No GPU detected! Training may be very slow.")
     
+    # ============================================
+    # 공개 코드 오류 수정: 분할 재사용과 실패 샘플 제거
+    # 실험용 확장·설정 변경: scene 분할·독립 validation/test, 로컬 graph context 연결
+    # ============================================
     def prepare_data(self):
         """Load and prepare the dataset for training."""
         logger.info(f"Loading dataset from: {self.config['data_path']}")
@@ -222,6 +252,9 @@ class QwenVLTrainer:
                               self.config["val_size"], self.config["test_size"], create=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         write_json(self.output_dir / "split_manifest.json", manifest)
+        from graph_context import load_graph_context
+        context = load_graph_context(self.config['split_path'], rows, manifest)
+        write_json(self.output_dir / 'graph_context.json', context)
         write_json(self.output_dir / "training_config.json", self.config)
         skipped = []
         for name, attribute in [("train", "train_dataset"), ("validation", "val_dataset")]:
@@ -239,7 +272,10 @@ class QwenVLTrainer:
         logger.info("Prepared %s training and %s validation samples; independent test untouched",
                     len(self.train_dataset), len(self.val_dataset))
 
-    # Add early stopping callback
+    # ============================================
+    # 실험용 확장·설정 변경: 원본 CUDA 질문 loss 정책 명시, epoch별 검증
+    # 논문/공개 코드의 optimizer·LoRA·early-stopping 기본값은 공통 설정으로 유지한다.
+    # ============================================
     def setup_trainer(self):
         """Set up the SFT Trainer for fine-tuning."""
         logger.info("Setting up trainer")
@@ -256,7 +292,10 @@ class QwenVLTrainer:
         self.trainer = SFTTrainer(
             model=self.model,
             processing_class=self.tokenizer,
-            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=self.config["max_seq_length"], resize=(224, 224)),  # Bound six-image memory
+            # 실험용 확장·설정 변경: 공개 CUDA loss 정책을 명시. 질문도 학습하며 image/pad는 collator가 제외한다.
+            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=self.config["max_seq_length"],
+                                                  resize=(self.config['image_size'], self.config['image_size']),
+                                                  train_on_responses_only=False),
             train_dataset=self.train_dataset,
             eval_dataset=self.val_dataset,
             args=SFTConfig(
@@ -271,15 +310,15 @@ class QwenVLTrainer:
                 fp16=not is_bf16_supported(),
                 bf16=is_bf16_supported(),
                 logging_steps=self.config["logging_steps"],
-                optim="paged_adamw_8bit",
+                optim=self.config['optimizer'],
                 weight_decay=self.config["weight_decay"],
-                lr_scheduler_type="linear",
+                lr_scheduler_type=self.config['scheduler'],
                 seed=self.config["seed"],
                 output_dir=str(self.output_dir),
                 report_to="wandb" if self.config["use_wandb"] else "none",
                 
                 # Memory optimization options
-                gradient_checkpointing=True,
+                gradient_checkpointing=self.config['grad_checkpoint'],
                 ddp_find_unused_parameters=False,
                 dataloader_num_workers=0,  # Reduces CPU memory usage
                 dataloader_pin_memory=False,  # Reduces CPU->GPU transfer overhead
@@ -302,7 +341,7 @@ class QwenVLTrainer:
                 metric_for_best_model="eval_loss",
                 greater_is_better=False,
             ),
-            callbacks=[] if self.config["max_steps"] > 0 else [EarlyStoppingCallback(early_stopping_patience=2)],
+            callbacks=[] if self.config["max_steps"] > 0 else [EarlyStoppingCallback(early_stopping_patience=self.config['early_stopping_patience'])],
         )
     
     def train(self):
@@ -320,7 +359,11 @@ class QwenVLTrainer:
             logger.info(f"Saving model to {self.output_dir}")
             self.trainer.save_model(str(self.output_dir))
             self.tokenizer.save_pretrained(str(self.output_dir))
-            write_json(self.output_dir / "completed.json", {"smoke": self.config["max_steps"] > 0})
+            write_json(self.output_dir / "completed.json", {"smoke": self.config["max_steps"] > 0,
+                       'global_step': self.trainer.state.global_step, 'epoch': self.trainer.state.epoch,
+                       'best_model_checkpoint': self.trainer.state.best_model_checkpoint,
+                       'best_metric': self.trainer.state.best_metric,
+                       'peak_memory_bytes': torch.cuda.max_memory_allocated()})
             
             # Log model metadata to wandb if enabled
             if self.config["use_wandb"]:
@@ -410,6 +453,10 @@ def main():
     
     # Add to config dictionary
     config = {
+        **backend_settings(args.experiment, 'cuda'),
+        'experiment': args.experiment,
+        'experiment_sha256': config_hash(args.experiment),
+        'backend': 'cuda',
         "model_id": args.model_id,
         "exact_output_dir": args.exact_output_dir,
         "max_steps": args.max_steps,
@@ -449,6 +496,9 @@ def main():
         
         # Prepare dataset
         trainer.prepare_data()
+
+        # Model weights are loaded only after the full input/context preflight succeeds.
+        trainer._load_model()
         
         # Setup trainer
         trainer.setup_trainer()
