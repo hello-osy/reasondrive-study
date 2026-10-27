@@ -5,6 +5,10 @@
 # ============================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
+case "${REPORT_PROFILE:-}" in
+  ''|public_baseline|modified) ;;
+  *) echo 'Unknown REPORT_PROFILE' >&2; exit 2 ;;
+esac
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
   echo 'Ubuntu 24.04 amd64 (x86_64) 전용입니다.' >&2; exit 1;
 }
@@ -32,7 +36,20 @@ uv pip check --python "$PYTHON"
 export HF_HOME="$PWD/.cache/huggingface"
 export MPLCONFIGDIR="$PWD/.cache/matplotlib"
 export TOKENIZERS_PARALLELISM=false
-RUN_DIR=$(mktemp -d "$PWD/outputs_ubuntu_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+# ============================================
+# 실험용 확장·설정 변경: 보고서 실험별 출력 격리와 완료/실패 기록
+# ============================================
+if [[ -n ${REPORT_PROFILE:-} ]]; then
+  REPORT_RESULTS_ROOT="${REPORT_RESULTS_ROOT:-outputs/report_experiments}"
+  mkdir -p "$REPORT_RESULTS_ROOT/$REPORT_PROFILE"
+  REPORT_PARENT="$(cd "$REPORT_RESULTS_ROOT/$REPORT_PROFILE" && pwd)"
+  RUN_DIR=$(mktemp -d "$REPORT_PARENT/$(date +%Y%m%d_%H%M%S)_XXXXXX")
+  "$PYTHON" scripts/report_experiment.py start --profile "$REPORT_PROFILE" --run_dir "$RUN_DIR"
+  trap 'REPORT_EXIT_CODE=$?; if [[ $REPORT_EXIT_CODE != 0 ]]; then "$PYTHON" scripts/report_experiment.py fail --profile "$REPORT_PROFILE" --run_dir "$RUN_DIR" --exit_code "$REPORT_EXIT_CODE"; fi' EXIT
+  exec > >(tee -a "$RUN_DIR/run.log") 2>&1
+else
+  RUN_DIR=$(mktemp -d "$PWD/outputs_ubuntu_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+fi
 uv pip freeze --python "$PYTHON" > "$RUN_DIR/requirements-resolved.txt"
 uv --version > "$RUN_DIR/uv-version.txt"
 nvidia-smi > "$RUN_DIR/nvidia-smi.txt"
@@ -70,6 +87,12 @@ print('CUDA / bitsandbytes 4bit 실행 확인')
 write_json(sys.argv[1] + '/environment.json', runtime_metadata('cuda'))
 PY
 "$PYTHON" scripts/download_data.py --image_root "$IMAGE_ROOT"
+# 공개 조건은 수정본의 scene split/전처리 복구 경로에 들어가지 않는다.
+if [[ ${REPORT_PROFILE:-} == public_baseline ]]; then
+  "$PYTHON" scripts/report_experiment.py public_baseline --run_dir "$RUN_DIR" \
+    --config "$RUN_CONFIG" --data_path data/drivelm.json --image_root "$IMAGE_ROOT"
+  exit 0
+fi
 "$PYTHON" scripts/prepare_inputs.py --image_root "$IMAGE_ROOT" \
   --config "$RUN_CONFIG" --split_path "$RUN_DIR/split_manifest.json" --report_path "$RUN_DIR/input_repair_report.json"
 COMMON=(--config "$RUN_CONFIG" --data_path data/drivelm.json
@@ -84,9 +107,16 @@ for MODE in simple reason; do
   "$PYTHON" scripts/eval_finetuned_models.py --config "$RUN_CONFIG" --model_path "$RUN_DIR/$MODE" \
     --data_path data/drivelm.json --base_image_path "$IMAGE_ROOT" --output_path "$RUN_DIR/$MODE.json"
 done
-"$PYTHON" scripts/eval_finetuned_models.py --config "$RUN_CONFIG" --instruct \
-  --split_path "$RUN_DIR/split_manifest.json" --data_path data/drivelm.json \
-  --base_image_path "$IMAGE_ROOT" --output_path "$RUN_DIR/instruct.json"
-"$PYTHON" scripts/evaluate.py --responses "instruct=$RUN_DIR/instruct.json" "simple=$RUN_DIR/simple.json" "reason=$RUN_DIR/reason.json" \
-  --data_path data/drivelm.json --output_dir "$RUN_DIR/comparison"
+if [[ ${REPORT_PROFILE:-} == modified ]]; then
+  # 보고서의 두 실험은 각각 Simple/Reason 두 모델을 표로 만든다.
+  "$PYTHON" scripts/evaluate.py --responses "simple=$RUN_DIR/simple.json" "reason=$RUN_DIR/reason.json" \
+    --data_path data/drivelm.json --output_dir "$RUN_DIR/comparison"
+  "$PYTHON" scripts/report_experiment.py complete --profile modified --run_dir "$RUN_DIR"
+else
+  "$PYTHON" scripts/eval_finetuned_models.py --config "$RUN_CONFIG" --instruct \
+    --split_path "$RUN_DIR/split_manifest.json" --data_path data/drivelm.json \
+    --base_image_path "$IMAGE_ROOT" --output_path "$RUN_DIR/instruct.json"
+  "$PYTHON" scripts/evaluate.py --responses "instruct=$RUN_DIR/instruct.json" "simple=$RUN_DIR/simple.json" "reason=$RUN_DIR/reason.json" \
+    --data_path data/drivelm.json --output_dir "$RUN_DIR/comparison"
+fi
 echo "완료: $RUN_DIR/comparison/comparison.md"

@@ -1,0 +1,9 @@
+{
+  "upstream_commit": "326caecafedad1b9dbc156ebd77c8dc0eb998740",
+  "repository": "https://github.com/zhourobotics/reasondrive",
+  "files": {
+    "vlm-finetuning.py": "d22bbf8dcbc313a7abf19bbb31ddaa1a4555a86e6f2cf9bf57b17a0c21ce720e",
+    "eval_finetuned_models.py": "9cd6b0b19bdddebb3bdcd6e3fbe355152feca6e7fbd3011d2b4e3ab527130994",
+    "LICENSE": "c65e372638b391b62fd8074e47672a902ddcab65457521d8c7e385437c212650"
+  }
+}

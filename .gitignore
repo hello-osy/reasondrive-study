@@ -53,6 +53,7 @@ wandb/
 .venv*/
 
 .cache/
+.tools/
 results/
 splits/
 
