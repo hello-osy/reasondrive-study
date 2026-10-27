@@ -10,6 +10,7 @@
 """
 import hashlib
 import json
+import shutil
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
@@ -122,6 +123,8 @@ def _download(url, target, confirmations=0):
 
 def official_annotations(cache_path):
     """Download only the 193 MB (184 MiB) annotation, never images or model weights."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import HfHubHTTPError
     path = Path(cache_path)
     if path.is_file() and _digest_file(path) == ANNOTATION_SHA256:
         return path
@@ -132,12 +135,20 @@ def official_annotations(cache_path):
     urls = [ANNOTATION_URL, f'https://drive.google.com/uc?export=download&id={GOOGLE_ID}']
     for url in urls:
         try:
-            _download(url, temporary)
+            if url == ANNOTATION_URL:
+                # Hub client uses the configured login token and shared download cache.
+                cached = hf_hub_download('OpenDriveLab/DriveLM', ANNOTATION_NAME,
+                                         repo_type='dataset', revision=ANNOTATION_REVISION)
+                if Path(cached).stat().st_size > MAX_ANNOTATION_BYTES:
+                    raise ValueError('DriveLM annotation exceeds the expected 210 MiB limit')
+                shutil.copyfile(cached, temporary)
+            else:
+                _download(url, temporary)
             if _digest_file(temporary) != ANNOTATION_SHA256:
                 raise ValueError('Official annotation SHA-256 mismatch')
             temporary.replace(path)
             return path
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, HfHubHTTPError) as error:
             failures.append(str(error))
             temporary.unlink(missing_ok=True)
     raise ValueError('Cannot restore graph roots before training. Provide --drivelm_annotations '

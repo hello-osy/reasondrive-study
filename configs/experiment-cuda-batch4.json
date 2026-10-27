@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "description": "CUDA 배치 4, gradient accumulation 3: 유효 배치 12 유지. 공개 조건의 배치 변경을 별도로 기록.",
+  "common": {
+    "epochs": 3,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 3,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "lora_r": 8,
+    "lora_alpha": 8,
+    "lora_dropout": 0,
+    "seed": 3407,
+    "max_seq_length": 2048,
+    "image_size": 224,
+    "val_size": 0.1,
+    "test_size": 0.1,
+    "max_new_tokens": 512,
+    "do_sample": false,
+    "train_on_responses_only": false,
+    "grad_checkpoint": true,
+    "evaluation_strategy": "epoch",
+    "early_stopping_patience": 2
+  },
+  "backends": {
+    "cuda": {
+      "model_id": "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit",
+      "model_revision": "f9adca15cefb612e7f03a1c8a5fddb920b1786f3",
+      "optimizer": "paged_adamw_8bit",
+      "scheduler": "linear",
+      "warmup_steps": 50,
+      "quantization": "bitsandbytes_4bit",
+      "mixed_precision": "hardware_auto",
+      "vision_loss_policy": "collator_masks_image_and_padding_tokens"
+    },
+    "mlx": {
+      "model_id": "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+      "model_revision": "46d4cf06a06ffc1a766c214174f9cbed2f45bcab",
+      "optimizer": "adamw",
+      "scheduler": "constant",
+      "warmup_steps": 0,
+      "quantization": "mlx_4bit",
+      "mixed_precision": "model_dtype",
+      "vision_loss_policy": "backend_full_sequence_includes_image_placeholders"
+    }
+  }
+}

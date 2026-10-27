@@ -105,19 +105,24 @@ def normalize_public(raw, records):
 
 
 def public_settings(experiment):
-    """Only model snapshot and epochs are configurable for the preserved baseline."""
+    """Keep upstream settings, allowing a recorded batch/accumulation override."""
     from experiment_config import backend_settings
     settings = backend_settings(experiment, 'cuda')
-    fixed = {'batch_size': 1, 'gradient_accumulation_steps': 12, 'learning_rate': 2e-4,
+    fixed = {'learning_rate': 2e-4,
              'weight_decay': .01, 'warmup_steps': 50, 'lora_r': 8, 'lora_alpha': 8,
              'lora_dropout': 0, 'seed': 3407, 'test_size': .1, 'max_seq_length': 2048,
              'image_size': 224, 'max_new_tokens': 512}
     if any(settings[key] != value for key, value in fixed.items()):
-        raise ValueError('public_baseline preserves upstream defaults; only model/revision/epochs overrides are supported')
-    return {**fixed, 'epochs': settings['epochs'], 'model_id': settings['model_id'],
+        raise ValueError('public_baseline preserves upstream defaults; only model/revision/epochs/batching overrides are supported')
+    return {**fixed, 'batch_size': settings['batch_size'],
+            'gradient_accumulation_steps': settings['gradient_accumulation_steps'],
+            'effective_batch_size': settings['batch_size'] * settings['gradient_accumulation_steps'],
+            'batching_override': settings['batch_size'] != 1 or settings['gradient_accumulation_steps'] != 12,
+            'epochs': settings['epochs'], 'model_id': settings['model_id'],
             'model_revision': settings['model_revision'], 'train_seed': 3407,
             'eval_split_seed': 3047, 'generation_seed': None, 'collator_max_seq_length': 4096,
-            'evaluation_strategy': 'steps', 'eval_steps': 10, 'save_steps': 50,
+            'evaluation_strategy': 'steps', 'eval_steps': 100, 'save_steps': 100,
+            'evaluation_schedule_override': {'upstream_eval_steps': 10, 'upstream_save_steps': 50},
             'early_stopping_patience': 2, 'do_sample': True, 'temperature': .7, 'top_p': .9,
             'loss_policy': 'upstream_unspecified_runtime_default_false',
             'split_policy': 'QA 90/10; final evaluation resplit with seed 3047',
@@ -134,6 +139,15 @@ def run_public(args):
     data_path, image_root = Path(args.data_path).resolve(), Path(args.image_root).resolve()
     experiment = load_experiment(args.config)
     effective = public_settings(experiment)
+    resume = getattr(args, 'resume', False)
+    if resume:
+        if json.loads((run_dir / 'public_settings.json').read_text()) != effective:
+            raise ValueError('Resume requires the original experiment settings')
+        if any(run_dir.glob('*.raw.json*')):
+            raise ValueError('This resume path supports interrupted training before final inference only')
+        recovery = run_dir / 'resume_history' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        start(recovery, 'public_baseline')
+        state(run_dir, status='running', resume_source_manifest=str(recovery / 'source_manifest.json'))
     data = read_data(data_path)
     protocol = public_baseline_manifest(data)
     write_json(run_dir / 'public_protocol.json', protocol)
@@ -146,15 +160,53 @@ def run_public(args):
     write_json(run_dir / 'base_model.json', source)
     # Both train from the base snapshot in independent processes, never from each other's adapter.
     models = {}
+    training_config_by_mode = {}
     for mode in ('simple', 'reason'):
         output = run_dir / mode
+        resume_options = []
+        batch_size, accumulation = effective['batch_size'], effective['gradient_accumulation_steps']
+        if resume and (output / 'training_result.json').is_file():
+            from public_baseline import latest_checkpoint
+            previous = json.loads((output / 'training_result.json').read_text())
+            expected = {'epochs': effective['epochs'], 'batch_size': effective['batch_size'],
+                        'gradient_accumulation_steps': effective['gradient_accumulation_steps'],
+                        'eval_steps': effective['eval_steps'], 'save_steps': effective['save_steps']}
+            if (previous.get('mode') != mode or previous.get('data_sha256') != digest(data_path)
+                    or previous.get('model_path') != str(snapshot)
+                    or previous.get('image_root') != str(image_root)
+                    or any(previous.get('original_training_config', previous['effective_training_config']).get(k) != v
+                           for k, v in expected.items())):
+                raise ValueError(f'Resume provenance mismatch: {mode}')
+            if previous['status'] == 'completed':
+                adapter = Path(previous['actual_output_dir'])
+                if not all((adapter / f).is_file() for f in ('adapter_model.safetensors', 'adapter_config.json')):
+                    raise ValueError(f'Completed model files missing: {adapter}')
+                models[mode] = str(adapter)
+                training_config_by_mode[mode] = previous['effective_training_config']
+                print(f'{mode}: 완료된 모델 재사용: {adapter}', flush=True)
+                continue
+            checkpoint = latest_checkpoint(previous)
+            print(f'{mode}: 체크포인트에서 재개: {checkpoint}', flush=True)
+            resume_options = ['--resume_from_checkpoint', checkpoint]
+            requested_batch = getattr(args, 'resume_batch_size', None)
+            if requested_batch is not None:
+                total_batch = effective['batch_size'] * effective['gradient_accumulation_steps']
+                if requested_batch < 1 or total_batch % requested_batch:
+                    raise ValueError('Resume batch size must be a positive divisor of the effective batch size')
+                batch_size, accumulation = requested_batch, total_batch // requested_batch
+                resume_options += ['--allow_resume_batch_change']
         run_step(run_dir, 'train_' + mode, [ROOT / 'scripts/public_baseline.py', 'train',
                  '--mode', mode, '--model_path', snapshot, '--data_path', data_path,
-                 '--image_root', image_root, '--output_dir', output, '--epochs', effective['epochs']])
+                 '--image_root', image_root, '--output_dir', output, '--epochs', effective['epochs'],
+                 '--batch_size', batch_size,
+                 '--gradient_accumulation_steps', accumulation,
+                 '--eval_steps', effective['eval_steps'], '--save_steps', effective['save_steps'],
+                 *resume_options])
         trained = json.loads((output / 'training_result.json').read_text())
         if trained['status'] != 'completed':
             raise ValueError('Upstream training did not complete')
         models[mode] = trained['actual_output_dir']
+        training_config_by_mode[mode] = trained['effective_training_config']
     records = [(str(i), data[i], True) for i in protocol['test_indices']]
     records += [(item['id'], item, False) for item in context['items']]
     ordered_path = run_dir / 'evaluation_inputs.json'
@@ -179,13 +231,15 @@ def run_public(args):
             'max_new_tokens': 512, 'do_sample': True, 'temperature': .7, 'top_p': .9,
             'backend': 'cuda', 'image_size': 224, 'model_source': source,
             'experiment_sha256': dataset_hash(effective), 'effective_settings': effective,
+            'training_config_by_mode': training_config_by_mode,
             'graph_context_sha256': context['sha256'], 'runtime': runtime_metadata('cuda'),
             'source_sha256': json.loads((run_dir / 'status.json').read_text())['source_sha256']})
         paths.append((mode, path))
     state(run_dir, stage='score_no_gpt')
     table, counts = compare(paths, data, protocol='public_baseline')
     write_report(table, counts, run_dir / 'comparison', protocol='public_baseline',
-                 provenance={'settings': effective, 'protocol_manifest': protocol, 'base_model': source})
+                 provenance={'settings': effective, 'protocol_manifest': protocol, 'base_model': source,
+                             'training_config_by_mode': training_config_by_mode})
     complete(run_dir, 'public_baseline')
 
 
@@ -289,6 +343,8 @@ def main():
     p = sub.add_parser('public_baseline');p.add_argument('--run_dir', required=True)
     p.add_argument('--config', required=True);p.add_argument('--data_path', default='data/drivelm.json')
     p.add_argument('--image_root', default='data/nuscenes')
+    p.add_argument('--resume', action='store_true', help='Reuse completed training and resume interrupted training')
+    p.add_argument('--resume_batch_size', type=int, help='Resume with this microbatch size, preserving effective batch size')
     p = sub.add_parser('summarize');p.add_argument('--root', default='outputs/report_experiments')
     args = parser.parse_args()
     if args.command == 'plan':

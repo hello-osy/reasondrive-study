@@ -10,6 +10,8 @@ if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
   exit 1
 fi
 IMAGE_ROOT="${1:-$PWD/data/nuscenes}"
+source scripts/hf_auth.sh
+require_hf_token
 CONFIG_OVERRIDES=()
 case "${GRAD_CHECKPOINT:-}" in
   '') ;;

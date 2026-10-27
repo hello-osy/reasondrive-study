@@ -35,6 +35,8 @@ fi
   exit 1
 }
 export REPORT_RESULTS_ROOT="${REPORT_RESULTS_ROOT:-outputs/report_experiments}"
+source scripts/hf_auth.sh
+require_hf_token
 PROFILES=("$PROFILE")
 [[ $PROFILE != both ]] || PROFILES=(public_baseline modified)
 for CURRENT_PROFILE in "${PROFILES[@]}"; do

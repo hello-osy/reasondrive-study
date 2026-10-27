@@ -39,8 +39,6 @@ def validate_config(config):
         raise ValueError('grad_checkpoint must be a boolean')
     if common['image_size'] != 224:
         raise ValueError('The shared input formatter currently supports image_size=224 only')
-    if common['batch_size'] != 1:
-        raise ValueError('The paired CUDA/MLX workflow currently requires batch_size=1')
     if common['train_on_responses_only'] is not False:
         raise ValueError('C1 uses the public CUDA full-text loss policy in both backends')
     if common['evaluation_strategy'] != 'epoch' or common['do_sample'] is not False:
@@ -66,6 +64,8 @@ def load_experiment(path=None):
 
 
 def backend_settings(config, backend):
+    if backend == 'mlx' and config['common']['batch_size'] != 1:
+        raise ValueError('The MLX workflow currently requires batch_size=1; use configs/experiment.json')
     return {**config['common'], **config['backends'][backend]}
 
 

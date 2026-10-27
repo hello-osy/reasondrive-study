@@ -7,6 +7,7 @@ import ast
 import contextlib
 import copy
 import io
+import inspect
 import json
 import logging
 import os
@@ -25,6 +26,28 @@ import public_baseline as baseline
 
 
 class PublicBaselineTests(unittest.TestCase):
+    def test_collator_default_follows_forwarding_constructor(self):
+        class Base:
+            def __init__(self, model, processor, train_on_responses_only=False):
+                self.train_on_responses_only = train_on_responses_only
+        class Wrapper(Base):
+            def __init__(self, *args, padding_free=False, **kwargs):
+                super().__init__(*args, **kwargs)
+        default, source = baseline.collator_loss_default(Wrapper)
+        self.assertIs(default, False)
+        self.assertTrue(source.endswith('.Base'))
+        self.assertIs(Wrapper(None, None).train_on_responses_only, False)
+
+        class Changed(Base):
+            def __init__(self, *args, train_on_responses_only=True, **kwargs):
+                super().__init__(*args, train_on_responses_only=train_on_responses_only, **kwargs)
+        self.assertIs(baseline.collator_loss_default(Changed)[0], True)
+
+        class Unknown(Base):
+            def __init__(self, model, processor):
+                pass
+        self.assertIs(baseline.collator_loss_default(Unknown)[0], inspect.Parameter.empty)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -247,7 +270,8 @@ class PublicBaselineTests(unittest.TestCase):
     def test_training_result_reports_actual_directory_and_keeps_loss_default(self):
         module = self.trainer_module()
         args = argparse.Namespace(command='train', mode='reason', data_path=str(self.data), model_path=str(self.directory),
-                                  image_root=str(self.directory), output_dir=str(self.directory / 'run'), epochs=3)
+                                  image_root=str(self.directory), output_dir=str(self.directory / 'run'), epochs=3,
+                                  batch_size=24, gradient_accumulation_steps=1)
         audit = {'compatibility_patches': [], 'status': 'running'}
         fake_transformers = types.SimpleNamespace(EarlyStoppingCallback=lambda **kwargs: kwargs)
         old_cwd = Path.cwd()
@@ -259,6 +283,12 @@ class PublicBaselineTests(unittest.TestCase):
         self.assertEqual(saved['status'], 'completed')
         self.assertEqual(saved['actual_output_dir'], str((Path(args.output_dir) / 'original_timestamp_directory').resolve()))
         self.assertFalse(saved['effective_training_config']['use_wandb'])
+        self.assertEqual(saved['effective_training_config']['batch_size'], 24)
+        self.assertEqual(saved['effective_training_config']['gradient_accumulation_steps'], 1)
+        self.assertEqual(saved['effective_training_config']['eval_steps'], 100)
+        self.assertEqual(saved['effective_training_config']['save_steps'], 100)
+        self.assertTrue(any(p['kind'] == 'evaluation_schedule_override' for p in saved['compatibility_patches']))
+        self.assertTrue(any(p['kind'] == 'batching_override' for p in saved['compatibility_patches']))
         self.assertEqual(saved['upstream_default_config']['seed'], 3407)
         self.assertFalse(saved['collator_train_on_responses_only_default'])
         self.assertTrue(saved['example_returned_none'])
@@ -276,6 +306,61 @@ class PublicBaselineTests(unittest.TestCase):
         saved = json.loads((Path(args.output_dir) / 'training_result.json').read_text())
         self.assertEqual(saved['status'], 'failed')
         self.assertNotIn('actual_output_dir', saved)
+
+    def test_resume_restores_latest_checkpoint_and_original_output(self):
+        module = self.trainer_module()
+        output = self.directory / 'resume'
+        actual = output / 'original'
+        checkpoint = actual / 'checkpoint-500'
+        checkpoint.mkdir(parents=True)
+        for name in ('adapter_model.safetensors', 'adapter_config.json', 'optimizer.pt',
+                     'scheduler.pt', 'rng_state.pth', 'training_args.bin'):
+            (checkpoint / name).write_bytes(b'fixture')
+        (checkpoint / 'trainer_state.json').write_text('{"global_step":500,"max_steps":594}')
+        # An interrupted newer save must not be selected.
+        (actual / 'checkpoint-600').mkdir()
+        args = argparse.Namespace(command='train', mode='reason', data_path=str(self.data),
+            model_path=str(self.directory), image_root=str(self.directory), output_dir=str(output),
+            epochs=3, batch_size=8, gradient_accumulation_steps=3, eval_steps=100, save_steps=100,
+            resume_from_checkpoint=str(checkpoint), allow_resume_batch_change=True)
+        config = {**module.DEFAULT_CONFIG, 'model_id': args.model_path, 'data_path': args.data_path,
+                  'base_image_path': args.image_root, 'output_dir': str(output), 'epochs': 3,
+                  'use_wandb': False, 'batch_size': 24, 'gradient_accumulation_steps': 1,
+                  'eval_steps': 100, 'save_steps': 100}
+        previous = {'status': 'running', 'mode': 'reason', 'model_path': args.model_path,
+                    'image_root': args.image_root, 'data_sha256': baseline.sha256(self.data),
+                    'actual_output_dir': str(actual), 'effective_training_config': config}
+        baseline.write_json(output / 'training_result.json', previous)
+        self.assertEqual(baseline.latest_checkpoint(previous), checkpoint)
+        observed = []
+        def setup(self):
+            self.trainer = types.SimpleNamespace(args=types.SimpleNamespace(),
+                train=lambda **kwargs: observed.append((self.output_dir, kwargs,
+                    self.trainer.args.restore_callback_states_from_checkpoint)))
+        module.QwenVLTrainer.setup_trainer = setup
+        module.QwenVLTrainer.prepare_data = lambda self: setattr(self, 'train_dataset', [None] * 4752)
+        module.QwenVLTrainer.train = lambda self: self.trainer.train()
+        with patch.object(baseline, 'load_upstream', return_value=(module, baseline.verify_vendor())), \
+             patch.object(baseline, 'runtime_audit', return_value={'compatibility_patches': []}):
+            baseline.run_train(args)
+        self.assertEqual(observed, [(actual, {'resume_from_checkpoint': str(checkpoint)}, True)])
+        saved = json.loads((output / 'training_result.json').read_text())
+        self.assertEqual(saved['resume_global_step'], 500)
+        self.assertEqual(saved['resume_batching']['batch_size'], 8)
+        self.assertEqual(saved['resume_batching']['gradient_accumulation_steps'], 3)
+        self.assertEqual(saved['original_training_config']['batch_size'], 24)
+        self.assertEqual(saved['status'], 'completed')
+        self.assertEqual(len(list(output.glob('training_result.before_resume.*.json'))), 1)
+
+    def test_resume_batch_change_requires_same_effective_batch_and_other_settings(self):
+        old = {'batch_size': 24, 'gradient_accumulation_steps': 1, 'epochs': 3}
+        changed = {**old, 'batch_size': 8, 'gradient_accumulation_steps': 3}
+        previous = {'effective_training_config': old}
+        baseline.validate_resume_config(previous, changed, True)
+        for candidate, allow in [(changed, False), ({**changed, 'epochs': 4}, True),
+                                 ({**changed, 'gradient_accumulation_steps': 1}, True)]:
+            with self.assertRaises(ValueError):
+                baseline.validate_resume_config(previous, candidate, allow)
 
 
 if __name__ == '__main__':

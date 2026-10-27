@@ -92,6 +92,47 @@ class ReportExperimentTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):report.complete(run, profile)
         return run
 
+    def test_resume_skips_completed_simple_and_dispatches_reason_checkpoint(self):
+        run = self.root / 'resume'
+        config = load_experiment()
+        config['common'].update(batch_size=24, gradient_accumulation_steps=1)
+        write_json(run / 'experiment.json', config)
+        effective = report.public_settings(config)
+        write_json(run / 'public_settings.json', effective)
+        data_path = self.root / 'data.json'
+        write_json(data_path, [])
+        snapshot = str(self.root / 'base')
+        checkpoint = run / 'reason' / 'adapter' / 'checkpoint-500'
+        for mode in ('simple', 'reason'):
+            adapter = run / mode / 'adapter'
+            adapter.mkdir(parents=True)
+            for name in ('adapter_model.safetensors', 'adapter_config.json'):
+                (adapter / name).write_text('fixture')
+            write_json(run / mode / 'training_result.json', {
+                'status': 'completed' if mode == 'simple' else 'running', 'mode': mode,
+                'data_sha256': report.digest(data_path), 'model_path': snapshot,
+                'image_root': str(self.root), 'actual_output_dir': str(adapter),
+                'effective_training_config': {k: effective[k] for k in (
+                    'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_steps', 'save_steps')}})
+        args = types.SimpleNamespace(run_dir=run, config=run/'experiment.json',
+                                     data_path=data_path, image_root=self.root, resume=True, resume_batch_size=8)
+        with patch('evaluate.public_baseline_manifest', return_value={'test_indices': []}), \
+             patch('graph_context.prepare_graph_context', return_value={}), \
+             patch('experiment_config.resolve_model_source', return_value=(snapshot, {})), \
+             patch('public_baseline.latest_checkpoint', return_value=checkpoint), \
+             patch.object(report, 'start'), \
+             patch.object(report, 'run_step', side_effect=RuntimeError('dispatch captured')) as step, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'dispatch captured'):
+                report.run_public(args)
+        step.assert_called_once()
+        self.assertEqual(step.call_args.args[1], 'train_reason')
+        command = step.call_args.args[2]
+        self.assertEqual(command[command.index('--resume_from_checkpoint') + 1], checkpoint)
+        self.assertEqual(command[command.index('--batch_size') + 1], 8)
+        self.assertEqual(command[command.index('--gradient_accumulation_steps') + 1], 3)
+        self.assertIn('--allow_resume_batch_change', command)
+
     def test_two_tables_are_unpaired_and_absent_metrics_stay_na(self):
         self.completed('public_baseline');self.completed('modified')
         with contextlib.redirect_stdout(io.StringIO()):report.summarize(self.root)
@@ -121,6 +162,7 @@ class ReportExperimentTests(unittest.TestCase):
         from evaluate import compare, LANGUAGE_KEYS
         run = self.root / 'public_baseline' / 'workflow'
         config = load_experiment()
+        config['common'].update(batch_size=24, gradient_accumulation_steps=1)
         write_json(run / 'experiment.json', config)
         write_json(run / 'source_manifest.json', {})
         report.state(run, source_sha256='source-fixture', profile='public_baseline')
@@ -136,7 +178,8 @@ class ReportExperimentTests(unittest.TestCase):
             args = list(map(str, arguments))
             if stage.startswith('train_'):
                 out = Path(args[args.index('--output_dir')+1])
-                write_json(out / 'training_result.json', {'status': 'completed', 'actual_output_dir': str(out/'adapter')})
+                write_json(out / 'training_result.json', {'status': 'completed', 'actual_output_dir': str(out/'adapter'),
+                                                         'effective_training_config': config['common']})
             else:
                 ordered = json.loads(Path(args[args.index('--data_path')+1]).read_text())
                 # Preserve a skipped row in the final denominator.
@@ -155,6 +198,14 @@ class ReportExperimentTests(unittest.TestCase):
              patch('evaluate.compare', side_effect=fake_compare), contextlib.redirect_stdout(io.StringIO()):
             report.run_public(args)
         self.assertEqual([stage for stage,_ in calls], ['train_simple','train_reason','infer_simple','infer_reason'])
+        for _, arguments in calls[:2]:
+            self.assertEqual(arguments[arguments.index('--batch_size') + 1], 24)
+            self.assertEqual(arguments[arguments.index('--gradient_accumulation_steps') + 1], 1)
+            self.assertEqual(arguments[arguments.index('--eval_steps') + 1], 100)
+            self.assertEqual(arguments[arguments.index('--save_steps') + 1], 100)
+        settings = json.loads((run / 'public_settings.json').read_text())
+        self.assertEqual(settings['effective_batch_size'], 24)
+        self.assertTrue(settings['batching_override'])
         bases = [str(args[args.index('--model_path')+1]) for _,args in calls[:2]]
         self.assertEqual(bases, [str(self.root/'base')]*2)
         result = report.load_completed(self.root, 'public_baseline')[1]

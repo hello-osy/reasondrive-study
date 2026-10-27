@@ -17,6 +17,8 @@ source /etc/os-release
   echo 'Ubuntu 24.04에서 실행하세요.' >&2; exit 1;
 }
 IMAGE_ROOT="${1:-$PWD/data/nuscenes}"
+source scripts/hf_auth.sh
+require_hf_token
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 command -v nvidia-smi >/dev/null && nvidia-smi || {
   echo 'NVIDIA 드라이버를 설치하고 재부팅한 뒤 nvidia-smi부터 확인하세요.' >&2; exit 1;
@@ -53,7 +55,7 @@ fi
 uv pip freeze --python "$PYTHON" > "$RUN_DIR/requirements-resolved.txt"
 uv --version > "$RUN_DIR/uv-version.txt"
 nvidia-smi > "$RUN_DIR/nvidia-smi.txt"
-CONFIG_OPTIONS=(--backend cuda --config "${EXPERIMENT_CONFIG:-configs/experiment.json}" --output "$RUN_DIR/experiment.json")
+CONFIG_OPTIONS=(--backend cuda --config "${EXPERIMENT_CONFIG:-configs/experiment-cuda-batch24.json}" --output "$RUN_DIR/experiment.json")
 [[ -z ${EPOCHS:-} ]] || CONFIG_OPTIONS+=(--epochs "$EPOCHS")
 [[ -z ${MODEL_ID:-} ]] || CONFIG_OPTIONS+=(--model_id "$MODEL_ID")
 [[ -z ${MODEL_REVISION:-} ]] || CONFIG_OPTIONS+=(--model_revision "$MODEL_REVISION")
