@@ -219,9 +219,11 @@ def route_and_score(responses, data, language_backend=language_scores, context=N
     return scores, counts
 
 
-def _experiment_conditions(meta):
+def _experiment_conditions(meta, allow_batching_difference=False):
     keys = ('backend', 'image_size', 'model_source', 'experiment_sha256')
     if not any(key in meta for key in keys):
+        if allow_batching_difference:
+            raise ValueError('Batch comparison requires full experiment provenance')
         return None  # Legacy synthetic fixtures and old complete-frame result files.
     if any(key not in meta or meta[key] is None for key in keys):
         raise ValueError('Comparison requires complete backend/image/model/experiment provenance')
@@ -229,12 +231,24 @@ def _experiment_conditions(meta):
     source_keys = ('model_id', 'resolved_revision', 'processor_revision')
     if not isinstance(source, dict) or any(not source.get(key) for key in source_keys):
         raise ValueError('Comparison requires resolved model and processor revisions')
+    fingerprint = meta['experiment_sha256']
+    if allow_batching_difference:
+        import copy
+        from experiment_config import config_hash, validate_config
+        experiment = copy.deepcopy(meta.get('experiment'))
+        if not isinstance(experiment, dict) or config_hash(experiment) != fingerprint:
+            raise ValueError('Batch comparison requires verified full experiment metadata')
+        validate_config(experiment)
+        experiment.pop('description', None)
+        for key in ('batch_size', 'gradient_accumulation_steps'):
+            experiment['common'].pop(key)
+        fingerprint = config_hash(experiment)
     return {'backend': meta['backend'], 'image_size': meta['image_size'],
-            'experiment_sha256': meta['experiment_sha256'],
+            'experiment_sha256': fingerprint,
             'model_source': {key: source[key] for key in source_keys}}
 
 
-def compare(paths, data, language_backend=language_scores, protocol='c1_scene'):
+def compare(paths, data, language_backend=language_scores, protocol='c1_scene', allow_batching_difference=False):
     if protocol not in PROTOCOLS:
         raise ValueError(f'Unknown evaluation protocol: {protocol}')
     paths = list(paths)
@@ -290,7 +304,7 @@ def compare(paths, data, language_backend=language_scores, protocol='c1_scene'):
         # 실험용 확장·설정 변경: Instruct/Simple/Reason의 동일 조건 검증
         # ============================================
         # Variant and prompt_mode intentionally differ; cache paths need not be identical.
-        signature['experiment_conditions'] = _experiment_conditions(meta)
+        signature['experiment_conditions'] = _experiment_conditions(meta, allow_batching_difference)
         if meta['split'] != 'test':
             raise ValueError('Only the declared test/evaluation results may be compared')
         if expected is not None and (truth != expected or signature != expected_meta):
@@ -327,6 +341,15 @@ def write_report(table, counts, output_dir, protocol='c1_scene', provenance=None
                       if protocol == 'public_baseline' else
                       'c1_scene: all QA rows from the held-out test scenes; failures remain in the response set.')
     diagnostics = []
+    batching = {}
+    for model, entry in (provenance or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        common = entry.get('metadata', {}).get('experiment', {}).get('common', {})
+        if 'batch_size' in common and 'gradient_accumulation_steps' in common:
+            batching[model] = {key: common[key] for key in ('batch_size', 'gradient_accumulation_steps')}
+    if len({(v['batch_size'], v['gradient_accumulation_steps']) for v in batching.values()}) > 1:
+        condition_note += ' 학습 배치가 서로 다르므로 점수 차이를 추론 학습만의 효과로 해석할 수 없다. ' + str(batching)
     fields = ('total', 'valid_answers', 'status_ok', 'status_error', 'status_invalid_format',
               'status_unknown', 'invalid_format', 'empty_predictions', 'finish_length',
               'graph_excluded', 'accuracy', 'language', 'match', 'gpt_only_omitted',
@@ -337,7 +360,7 @@ def write_report(table, counts, output_dir, protocol='c1_scene', provenance=None
         diagnostics.append({'model': row['model'], **{key: counts[row['model']][key] for key in fields}})
     report = {'schema_version': 2, 'protocol': protocol, 'metric_scope': note,
               'condition_scope': condition_note, 'counts': counts, 'rows': table,
-              'diagnostics': diagnostics, 'provenance': provenance or {},
+              'diagnostics': diagnostics, 'provenance': provenance or {}, 'batching_by_model': batching,
                'drivelm_commit': '1de72a74b257e5373400fa68239e99bd5d20580a',
               'language_evaluation_commit': '8e9e03feb7f5e605f20fc0c8dba0e24532a26216'}
     write_json(output / 'comparison.json', report)
@@ -384,11 +407,14 @@ def main():
     parser.add_argument('--data_path', required=True, help='Original ReasonDrive JSON/JSONL, including original_qa_pair.tag')
     parser.add_argument('--output_dir', default='results/comparison')
     parser.add_argument('--protocol', choices=PROTOCOLS, default='c1_scene')
+    parser.add_argument('--allow_batching_difference', action='store_true',
+                        help='Allow only recorded training batch/accumulation differences; all other checks remain')
     args = parser.parse_args()
     pairs = [value.split('=', 1) for value in args.responses]
     if any(len(pair) != 2 or not all(pair) for pair in pairs):
         parser.error('Use LABEL=PATH for each result file')
-    table, counts = compare(pairs, read_data(args.data_path), protocol=args.protocol)
+    options = {'allow_batching_difference': True} if args.allow_batching_difference else {}
+    table, counts = compare(pairs, read_data(args.data_path), protocol=args.protocol, **options)
     provenance = {label: {'responses': str(Path(path).resolve()),
                           'metadata': json.loads(Path(str(path) + '.meta.json').read_text())}
                   for label, path in pairs}

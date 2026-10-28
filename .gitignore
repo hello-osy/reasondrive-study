@@ -34,9 +34,9 @@ ENV/
 *.swo
 
 # Model checkpoints and outputs
-outputs*/
 checkpoints*/
 runs/
+outputs/report_experiments/public_baseline
 
 # Data
 data/

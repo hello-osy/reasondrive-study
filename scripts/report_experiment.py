@@ -243,6 +243,39 @@ def run_public(args):
     complete(run_dir, 'public_baseline')
 
 
+def write_v6_table(run_dir, report):
+    """Export V6 table 8 only from the scene-held-out Simple/Reason results."""
+    models = {row['model']: row for row in report['rows']}
+    if report['protocol'] != 'c1_scene' or set(models) != {'simple', 'reason'} or len(report['rows']) != 2:
+        raise ValueError('V6 requires scene-split Simple and Reason results')
+    counts = report['counts']
+
+    def score(mode, key):
+        value = models[mode][key]
+        return 'N/A' if value is None else f'{value:.4f}'
+
+    rows = [
+        ['지표', 'Simple', 'Reason'],
+        ['Accuracy', *[score(m, 'Accuracy') for m in ('simple', 'reason')]],
+        ['Accuracy 평가 문항 수', *[str(counts[m]['accuracy']) for m in ('simple', 'reason')]],
+        ['Final_noGPT', *[score(m, 'Final_noGPT') for m in ('simple', 'reason')]],
+        ['유효 응답 / 전체 입력', *[f"{counts[m]['valid_answers']} / {counts[m]['total']}" for m in ('simple', 'reason')]],
+    ]
+    out = Path(run_dir) / 'comparison'
+    lines = ['# V6 표 8 수정본의 평가 결과', '',
+             '| ' + ' | '.join(rows[0]) + ' |', '| --- | --- | --- |',
+             *['| ' + ' | '.join(row) + ' |' for row in rows[1:]], '',
+             'Accuracy와 Final_noGPT는 0~1 점수이다. N/A는 채점 대상 없음이며 0점이 아니다.',
+             '이 표만으로 논문 성능 재현을 단정하지 않는다. 논문과 데이터 분할·채점 조건이 다르다.',
+             '출처: 같은 폴더의 comparison.json. 실제 학습 설정: 실행 폴더의 experiment.json.', '']
+    if report.get('batching_by_model'):
+        lines += ['실제 모델별 학습 배치: ' + str(report['batching_by_model']),
+                  '배치가 서로 다르면 추론 학습 효과와 배치 변경 효과를 구분할 수 없다.', '']
+    (out / 'v6_table8.md').write_text('\n'.join(lines))
+    with (out / 'v6_table8.csv').open('w', newline='', encoding='utf-8-sig') as stream:
+        csv.writer(stream).writerows(rows)
+
+
 def complete(run_dir, profile):
     run_dir = Path(run_dir).resolve()
     report_path = run_dir / 'comparison/comparison.json'
@@ -260,6 +293,11 @@ def complete(run_dir, profile):
                        run_dir / mode / 'training_result.json']
         else:
             inputs += [run_dir / mode / 'completed.json', run_dir / mode / 'training_config.json']
+    if profile == 'modified':
+        write_v6_table(run_dir, report)
+        inputs += [run_dir / 'comparison/v6_table8.md', run_dir / 'comparison/v6_table8.csv']
+        if (run_dir / 'continuation.json').exists():
+            inputs += [run_dir / 'continuation.json', run_dir / 'simple_experiment.json']
     files = {str(p.relative_to(run_dir)): digest(p) for p in inputs}
     record = {'schema_version': 1, 'profile': profile, 'protocol': expected_protocol,
               'status': 'completed', 'files': files, 'comparison_type': 'descriptive_unpaired'}

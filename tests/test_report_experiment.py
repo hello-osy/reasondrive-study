@@ -92,6 +92,25 @@ class ReportExperimentTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):report.complete(run, profile)
         return run
 
+    def test_modified_completion_exports_v6_counts_and_missing_scores(self):
+        run = self.completed('modified')
+        text = (run / 'comparison/v6_table8.md').read_text()
+        self.assertIn('| Accuracy | 0.5000 | 0.5000 |', text)
+        self.assertIn('| Accuracy 평가 문항 수 | 2 | 2 |', text)
+        self.assertIn('| Final_noGPT | N/A | N/A |', text)
+        self.assertIn('| 유효 응답 / 전체 입력 | 1 / 2 | 1 / 2 |', text)
+        self.assertIsNotNone(report.load_completed(self.root, 'modified'))
+        (run / 'comparison/v6_table8.md').write_text('changed')
+        with self.assertRaises(ValueError):
+            report.load_completed(self.root, 'modified')
+
+    def test_v6_rejects_public_results(self):
+        run = self.completed('public_baseline')
+        self.assertFalse((run / 'comparison/v6_table8.md').exists())
+        data = json.loads((run / 'comparison/comparison.json').read_text())
+        with self.assertRaises(ValueError):
+            report.write_v6_table(run, data)
+
     def test_resume_skips_completed_simple_and_dispatches_reason_checkpoint(self):
         run = self.root / 'resume'
         config = load_experiment()
