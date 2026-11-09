@@ -1,5 +1,7 @@
 # ReasonDrive 변경 내역
 
+배치·손실 범위·추론 설정의 통제 비교 실험은 [ABLATION_STUDY.md](ABLATION_STUDY.md)에 정리했다. 기존 보고서용 실행과 별도 디렉터리를 사용한다.
+
 ## 실험 명령어(복붙)
 
 <details>

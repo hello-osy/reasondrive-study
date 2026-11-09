@@ -19,7 +19,8 @@ from typing import List, Dict, Union, Any, Optional
 from datetime import datetime
 from data_utils import load_split, format_sample, write_json, clean_message_content
 from experiment_config import (DEFAULT_PATH, load_experiment, backend_settings,
-                               override_experiment, config_hash, resolve_model_source, runtime_metadata)
+                               override_experiment, config_hash, resolve_model_source, runtime_metadata,
+                               vision_collator_settings, validate_resume_checkpoint, training_run_settings)
 
 from unsloth import FastVisionModel, is_bf16_supported
 from unsloth.trainer import UnslothVisionDataCollator
@@ -84,6 +85,7 @@ def parse_args():
     
     parser.add_argument("--model_id", type=str, default=DEFAULT_CONFIG["model_id"],
                         help="Model ID to use for fine-tuning")
+    parser.add_argument("--reasoning_source", default="original", help="original or complete train-only reasoning overlay JSON")
     parser.add_argument("--data_path", type=str, default=DEFAULT_CONFIG["data_path"],
                         help="Path to the dataset JSON file")
     parser.add_argument("--base_image_path", type=str, default=DEFAULT_CONFIG["base_image_path"],
@@ -129,7 +131,9 @@ def parse_args():
                         help="Use output_dir directly (must be empty)")
     parser.add_argument("--max_steps", type=int, default=-1,
                         help="Optimizer steps; positive values are smoke runs, not final models")
+    parser.add_argument('--resume_from_checkpoint', help='Resume an interrupted run with exactly the same config and split')
     parser.set_defaults(**{k: v for k, v in settings.items() if k != 'model_revision'})
+    parser.set_defaults(**training_run_settings(experiment, known.config))
     args = parser.parse_args()
     overrides = {k: getattr(args, k) for k in settings if hasattr(args, k)}
     args.experiment = override_experiment(experiment, 'cuda', overrides)
@@ -166,7 +170,15 @@ class QwenVLTrainer:
         
         if config["exact_output_dir"]:
             self.output_dir = Path(config["output_dir"])
-        if self.output_dir.exists() and any(self.output_dir.iterdir()):
+        resume = config.get('resume_from_checkpoint')
+        if resume:
+            if not config['exact_output_dir']:
+                raise ValueError('--resume_from_checkpoint requires --exact_output_dir')
+            config['resume_from_checkpoint'] = validate_resume_checkpoint(config, self.output_dir, resume)
+            history = self.output_dir / 'resume_history' / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            history.mkdir(parents=True)
+            (history / 'training_config.json').write_bytes((self.output_dir / 'training_config.json').read_bytes())
+        elif self.output_dir.exists() and any(self.output_dir.iterdir()):
             raise ValueError(f"Output directory must be empty: {self.output_dir}")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU is required; check nvidia-smi and the PyTorch CUDA wheel")
@@ -203,7 +215,7 @@ class QwenVLTrainer:
             self.model,
             finetune_vision_layers=False,  # Don't finetune vision layers to save memory
             finetune_language_layers=True,  # Finetune language layers
-            finetune_attention_modules=False,  # Don't finetune attention layers to save memory
+            finetune_attention_modules=self.config.get('finetune_attention_modules', False),
             finetune_mlp_modules=True,  # Finetune MLP layers
             r=self.config["lora_r"],
             lora_alpha=self.config["lora_alpha"],
@@ -216,6 +228,9 @@ class QwenVLTrainer:
         self.config['model_source'] = self.model_source
         self.config['runtime'] = runtime_metadata('cuda')
         self.config['actual_precision'] = 'bf16' if is_bf16_supported() else 'fp16'
+        self.config['actual_loss_policy'] = ('assistant_only_image_and_padding_masked'
+                                            if self.config['train_on_responses_only']
+                                            else 'full_text_image_and_padding_masked')
         self.config['trainable_parameters'] = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         write_json(self.output_dir / 'training_config.json', self.config)
         self._log_gpu_info()
@@ -250,6 +265,13 @@ class QwenVLTrainer:
         rows = list(dataset)
         manifest = load_split(rows, self.config["split_path"], self.config["seed"],
                               self.config["val_size"], self.config["test_size"], create=True)
+        from reasoning_source import load_reasoning_source, training_row
+        reasoning, provenance = load_reasoning_source(self.config.get('reasoning_source'), rows, manifest)
+        if self.config.get('resume_from_checkpoint'):
+            previous = json.loads((self.output_dir / 'training_config.json').read_text())
+            if previous.get('reasoning_source_provenance', {'kind': 'original'}) != provenance:
+                raise ValueError('Reasoning data changed since checkpoint')
+        self.config['reasoning_source_provenance'] = provenance
         self.output_dir.mkdir(parents=True, exist_ok=True)
         write_json(self.output_dir / "split_manifest.json", manifest)
         from graph_context import load_graph_context
@@ -257,16 +279,23 @@ class QwenVLTrainer:
         write_json(self.output_dir / 'graph_context.json', context)
         write_json(self.output_dir / "training_config.json", self.config)
         skipped = []
+        excluded_train = set(provenance.get('excluded_train_indices', []))
         for name, attribute in [("train", "train_dataset"), ("validation", "val_dataset")]:
             formatted = []
             for index in manifest["indices"][name]:
+                if name == 'train' and index in excluded_train:
+                    skipped.append({'index': index, 'split': name, 'error': 'excluded_conflict_by_explicit_selection'})
+                    continue
                 try:
-                    formatted.append(format_sample(rows[index], self.config["base_image_path"], self.config["mode"]))
+                    formatted.append(format_sample(training_row(rows[index], index, name, reasoning), self.config["base_image_path"], self.config["mode"]))
                 except (KeyError, ValueError, TypeError, OSError) as error:
                     skipped.append({"index": index, "split": name, "error": str(error)})
                     logger.warning("Skipping %s row %s: %s", name, index, error)
             setattr(self, attribute, Dataset.from_list(formatted))
-        write_json(self.output_dir / "skipped_samples.json", skipped)
+        skipped_path = self.output_dir / 'skipped_samples.json'
+        if self.config.get('resume_from_checkpoint') and json.loads(skipped_path.read_text()) != skipped:
+            raise ValueError('Eligible training rows changed since the interrupted run')
+        write_json(skipped_path, skipped)
         if not self.train_dataset or not self.val_dataset:
             raise ValueError("No usable training or validation samples; inspect skipped_samples.json")
         logger.info("Prepared %s training and %s validation samples; independent test untouched",
@@ -292,10 +321,9 @@ class QwenVLTrainer:
         self.trainer = SFTTrainer(
             model=self.model,
             processing_class=self.tokenizer,
-            # 실험용 확장·설정 변경: 공개 CUDA loss 정책을 명시. 질문도 학습하며 image/pad는 collator가 제외한다.
-            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer, max_seq_length=self.config["max_seq_length"],
-                                                  resize=(self.config['image_size'], self.config['image_size']),
-                                                  train_on_responses_only=False),
+            # C1 keeps full-text loss; the explicitly named ablation profile may mask user turns.
+            data_collator=UnslothVisionDataCollator(self.model, self.tokenizer,
+                                                  **vision_collator_settings(self.config)),
             train_dataset=self.train_dataset,
             eval_dataset=self.val_dataset,
             args=SFTConfig(
@@ -350,7 +378,7 @@ class QwenVLTrainer:
         
         try:
             # Run training
-            trainer_stats = self.trainer.train()
+            trainer_stats = self.trainer.train(resume_from_checkpoint=self.config.get('resume_from_checkpoint'))
             
             # Log training stats
             logger.info(f"Training completed. Stats: {trainer_stats}")
@@ -359,6 +387,8 @@ class QwenVLTrainer:
             logger.info(f"Saving model to {self.output_dir}")
             self.trainer.save_model(str(self.output_dir))
             self.tokenizer.save_pretrained(str(self.output_dir))
+            self.trainer.save_state()
+            write_json(self.output_dir / 'training_metrics.json', trainer_stats.metrics)
             write_json(self.output_dir / "completed.json", {"smoke": self.config["max_steps"] > 0,
                        'global_step': self.trainer.state.global_step, 'epoch': self.trainer.state.epoch,
                        'best_model_checkpoint': self.trainer.state.best_model_checkpoint,
@@ -460,10 +490,12 @@ def main():
         "model_id": args.model_id,
         "exact_output_dir": args.exact_output_dir,
         "max_steps": args.max_steps,
+        "resume_from_checkpoint": args.resume_from_checkpoint,
         "mode": args.mode,
         "split_path": args.split_path,
         "val_size": args.val_size,
         "data_path": args.data_path,
+        "reasoning_source": args.reasoning_source,
         "base_image_path": args.base_image_path,
         "output_dir": args.output_dir,
         "epochs": args.epochs,
@@ -487,6 +519,11 @@ def main():
         "wandb_run_name": args.wandb_run_name
     }
     
+    from reasoning_source import load_reasoning_source
+    from generate_reasoning import load_rows
+    source_rows = load_rows(config['data_path'])
+    source_split = load_split(source_rows, config['split_path'], config['seed'], config['val_size'], config['test_size'], create=True)
+    _, config['reasoning_source_provenance'] = load_reasoning_source(config['reasoning_source'], source_rows, source_split)
     logger.info("Starting Qwen 2.5VL fine-tuning")
     logger.info(f"Configuration: {json.dumps(config, indent=2)}")
     

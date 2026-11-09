@@ -47,7 +47,7 @@ class TrainingContractTests(unittest.TestCase):
                         and any(isinstance(t, ast.Name) and t.id == 'DEFAULT_CONFIG' for t in node.targets))
         method = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'parse_args')
         scope = {'argparse': argparse, 'DEFAULT_CONFIG': ast.literal_eval(defaults),
-                 **{name: getattr(cfg, name) for name in ('DEFAULT_PATH', 'load_experiment', 'backend_settings', 'override_experiment')}}
+                 **{name: getattr(cfg, name) for name in ('DEFAULT_PATH', 'load_experiment', 'backend_settings', 'override_experiment', 'training_run_settings')}}
         exec(compile(ast.Module(body=[method], type_ignores=[]), 'parse_args', 'exec'), scope)
         with patch.object(sys, 'argv', ['trainer']):
             args = scope['parse_args']()
@@ -56,6 +56,20 @@ class TrainingContractTests(unittest.TestCase):
         self.assertEqual(args.model_revision, expected['model_revision'])
         self.assertEqual(args.batch_size, 1)
         self.assertFalse(args.train_on_responses_only)
+        with patch.object(sys, 'argv', ['trainer', '--config', str(ROOT/'config.yaml')]):
+            local = scope['parse_args']()
+        self.assertEqual((local.mode, local.batch_size, local.gradient_accumulation_steps, local.epochs), ('reason',12,1,3))
+        self.assertFalse(local.use_wandb)
+        self.assertTrue(local.train_on_responses_only)
+        self.assertEqual(local.data_path,str(ROOT/'data/drivelm.json'))
+        self.assertEqual(local.reasoning_source,str(ROOT/'outputs/local_reasoning/qwen38_27b_iq3/reasoning_success_only.json'))
+        with patch.object(sys, 'argv', ['trainer','--config',str(ROOT/'config.yaml'),'--batch_size','8']):
+            self.assertEqual(scope['parse_args']().batch_size,8)
+
+    def test_yaml_run_rejects_typos_and_invalid_values(self):
+        for run in ({'batch_sze':12},{'mode':'other'},{'use_wandb':'false'},{'data_path':None}):
+            with self.assertRaises(ValueError):cfg.training_run_settings({'run':run},ROOT/'config.yaml')
+        self.assertEqual(cfg.training_run_settings({'run':{'reasoning_source':'original'}},ROOT/'config.yaml'),{'reasoning_source':'original'})
 
     def test_unpinned_models_and_loss_policy_drift_rejected(self):
         config = cfg.load_experiment()

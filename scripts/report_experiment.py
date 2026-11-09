@@ -294,6 +294,8 @@ def complete(run_dir, profile):
         else:
             inputs += [run_dir / mode / 'completed.json', run_dir / mode / 'training_config.json']
     if profile == 'modified':
+        if (run_dir / 'reasoning_overlay.json').exists():
+            inputs.append(run_dir / 'reasoning_overlay.json')
         write_v6_table(run_dir, report)
         inputs += [run_dir / 'comparison/v6_table8.md', run_dir / 'comparison/v6_table8.csv']
         if (run_dir / 'continuation.json').exists():

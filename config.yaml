@@ -1,0 +1,55 @@
+# 학습 파라미터: common / 실행·데이터 경로: run
+# 상대 경로는 이 YAML 파일 위치 기준입니다.
+schema_version: 1
+description: '성공한 로컬 추론 4161문항으로 Reason만 학습: batch 12 × accumulation 1, 최대 3 epochs.'
+common:
+  epochs: 3
+  batch_size: 12
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  lora_r: 8
+  lora_alpha: 8
+  lora_dropout: 0
+  seed: 3407
+  max_seq_length: 2048
+  image_size: 224
+  val_size: 0.1
+  test_size: 0.1
+  max_new_tokens: 512
+  do_sample: false
+  train_on_responses_only: true
+  grad_checkpoint: true
+  evaluation_strategy: epoch
+  early_stopping_patience: 2
+  finetune_attention_modules: false
+backends:
+  cuda:
+    model_id: unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit
+    model_revision: f9adca15cefb612e7f03a1c8a5fddb920b1786f3
+    optimizer: paged_adamw_8bit
+    scheduler: linear
+    warmup_steps: 50
+    quantization: bitsandbytes_4bit
+    mixed_precision: hardware_auto
+    vision_loss_policy: collator_masks_image_and_padding_tokens
+  mlx:
+    model_id: mlx-community/Qwen2.5-VL-3B-Instruct-4bit
+    model_revision: 46d4cf06a06ffc1a766c214174f9cbed2f45bcab
+    optimizer: adamw
+    scheduler: constant
+    warmup_steps: 0
+    quantization: mlx_4bit
+    mixed_precision: model_dtype
+    vision_loss_policy: backend_full_sequence_includes_image_placeholders
+experiment_profile: ablation
+run:
+  mode: reason
+  data_path: data/drivelm.json
+  base_image_path: data/nuscenes
+  split_path: outputs/ablation_study/20261102_controlled/split_manifest.json
+  reasoning_source: outputs/local_reasoning/qwen38_27b_iq3/reasoning_success_only.json
+  output_dir: outputs/local_reasoning_experiments
+  use_wandb: false
+  exact_output_dir: false
+  max_steps: -1

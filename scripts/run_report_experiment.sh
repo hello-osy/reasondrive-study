@@ -15,6 +15,9 @@ case "$PROFILE" in
   public_baseline|modified|both) shift ;;
   *) usage >&2; exit 2 ;;
 esac
+if [[ ${REASONING_SOURCE:-original} != original && $PROFILE != modified ]]; then
+  echo '새 추론 데이터는 modified 프로필에서만 선택하세요.' >&2; exit 2
+fi
 IMAGE_ROOT=data/nuscenes
 DRY_RUN=0
 IMAGE_SET=0

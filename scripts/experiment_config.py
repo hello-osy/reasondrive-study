@@ -28,6 +28,9 @@ def config_hash(config):
 def validate_config(config):
     if config.get('schema_version') != 1:
         raise ValueError('Unsupported experiment schema')
+    profile = config.get('experiment_profile', 'c1_scene')
+    if profile not in ('c1_scene', 'ablation'):
+        raise ValueError('experiment_profile must be c1_scene or ablation')
     common = config['common']
     for key in ('epochs', 'batch_size', 'gradient_accumulation_steps', 'max_seq_length',
                 'image_size', 'max_new_tokens', 'early_stopping_patience', 'lora_r', 'lora_alpha'):
@@ -39,8 +42,13 @@ def validate_config(config):
         raise ValueError('grad_checkpoint must be a boolean')
     if common['image_size'] != 224:
         raise ValueError('The shared input formatter currently supports image_size=224 only')
-    if common['train_on_responses_only'] is not False:
+    for key in ('train_on_responses_only', 'finetune_attention_modules'):
+        if type(common.get(key, False)) is not bool:
+            raise ValueError(f'{key} must be a boolean')
+    if profile != 'ablation' and common['train_on_responses_only'] is not False:
         raise ValueError('C1 uses the public CUDA full-text loss policy in both backends')
+    if profile != 'ablation' and common.get('finetune_attention_modules', False):
+        raise ValueError('Attention LoRA changes require experiment_profile=ablation')
     if common['evaluation_strategy'] != 'epoch' or common['do_sample'] is not False:
         raise ValueError('C1 uses epoch validation and deterministic generation')
     if not 0 < common['val_size'] < 1 or not 0 < common['test_size'] < 1 or common['val_size'] + common['test_size'] >= 1:
@@ -60,13 +68,96 @@ def validate_config(config):
 
 
 def load_experiment(path=None):
-    return validate_config(json.loads(Path(path or DEFAULT_PATH).read_text()))
+    path = Path(path or DEFAULT_PATH)
+    if path.suffix.lower() in ('.yaml', '.yml'):
+        import yaml
+        data = yaml.safe_load(path.read_text())
+    else:
+        data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError('Experiment config must be a mapping')
+    return validate_config(data)
+
+
+def training_run_settings(config, config_path):
+    """Runtime defaults, with paths anchored to the config file, not the shell cwd."""
+    run = copy.deepcopy(config.get('run', {}))
+    paths = {'data_path', 'base_image_path', 'split_path', 'reasoning_source',
+             'output_dir', 'resume_from_checkpoint'}
+    allowed = paths | {'mode', 'use_wandb', 'wandb_project', 'wandb_run_name',
+                       'exact_output_dir', 'max_steps'}
+    if not isinstance(run, dict) or set(run) - allowed:
+        raise ValueError('Unknown run settings; training hyperparameters belong in common/backends')
+    if 'mode' in run and run['mode'] not in ('simple', 'reason'):
+        raise ValueError('run.mode must be simple or reason')
+    for key in ('use_wandb', 'exact_output_dir'):
+        if key in run and type(run[key]) is not bool:
+            raise ValueError(f'run.{key} must be a boolean')
+    if 'max_steps' in run and (type(run['max_steps']) is not int or run['max_steps'] == 0 or run['max_steps'] < -1):
+        raise ValueError('run.max_steps must be -1 or a positive integer')
+    for key in paths & run.keys():
+        if run[key] is None and key == 'resume_from_checkpoint':
+            continue
+        if not isinstance(run[key], str) or not run[key].strip():
+            raise ValueError(f'run.{key} must be a nonempty path')
+        if key == 'reasoning_source' and run[key] == 'original':
+            continue
+        path = Path(run[key]).expanduser()
+        run[key] = str((Path(config_path).resolve().parent / path).resolve())
+    return run
 
 
 def backend_settings(config, backend):
+    if backend == 'mlx' and config.get('experiment_profile') == 'ablation':
+        raise ValueError('The ablation training profile currently supports CUDA only')
     if backend == 'mlx' and config['common']['batch_size'] != 1:
         raise ValueError('The MLX workflow currently requires batch_size=1; use configs/experiment.json')
     return {**config['common'], **config['backends'][backend]}
+
+
+def vision_collator_settings(config):
+    """Keep the actual CUDA loss mask tied to the recorded experiment settings."""
+    settings = {
+        'max_seq_length': config['max_seq_length'],
+        'resize': (config['image_size'], config['image_size']),
+        'train_on_responses_only': config['train_on_responses_only'],
+    }
+    if config['train_on_responses_only']:
+        # These are the complete Qwen 2.5 chat role markers, not source-data tags.
+        # In particular, <think> remains supervised with the assistant response.
+        settings.update(instruction_part='<|im_start|>user\n',
+                        response_part='<|im_start|>assistant\n')
+    return settings
+
+
+def validate_resume_checkpoint(config, output_dir, checkpoint):
+    """Reject partial, foreign, changed-config and already completed resumes."""
+    output_dir, checkpoint = Path(output_dir).resolve(), Path(checkpoint).resolve()
+    if not checkpoint.is_relative_to(output_dir) or checkpoint.parent != output_dir:
+        raise ValueError('Resume checkpoint must be a direct child of the requested output directory')
+    if (output_dir / 'completed.json').exists():
+        raise ValueError('Training is already complete; choose a new output directory for a new experiment')
+    for name in ('trainer_state.json', 'optimizer.pt', 'scheduler.pt', 'rng_state.pth',
+                 'adapter_config.json', 'adapter_model.safetensors'):
+        if not (checkpoint / name).is_file():
+            raise ValueError(f'Incomplete resume checkpoint: missing {name}')
+    saved = json.loads((output_dir / 'training_config.json').read_text())
+    for key in ('experiment_sha256', 'mode', 'max_steps'):
+        if saved.get(key) != config.get(key):
+            raise ValueError(f'Resume settings differ from saved training: {key}')
+    if saved.get('reasoning_source_provenance', {'kind': 'original'}) != config.get('reasoning_source_provenance', {'kind': 'original'}):
+        raise ValueError('Resume reasoning source changed')
+    for key in ('data_path', 'base_image_path'):
+        if Path(saved[key]).resolve() != Path(config[key]).resolve():
+            raise ValueError(f'Resume input path differs from saved training: {key}')
+    current_split = json.loads(Path(config['split_path']).read_text())
+    saved_split = json.loads((output_dir / 'split_manifest.json').read_text())
+    if current_split != saved_split:
+        raise ValueError('Resume split differs from the saved training split')
+    state = json.loads((checkpoint / 'trainer_state.json').read_text())
+    if not isinstance(state.get('global_step'), int) or state['global_step'] <= 0:
+        raise ValueError('Resume checkpoint has no completed optimizer steps')
+    return str(checkpoint)
 
 
 def override_experiment(config, backend, overrides):

@@ -21,3 +21,5 @@ qwen-vl-utils
 huggingface-hub
 gdown==5.2.0
 -r requirements-eval.txt
+
+PyYAML>=6.0

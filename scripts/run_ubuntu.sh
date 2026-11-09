@@ -17,6 +17,9 @@ source /etc/os-release
   echo 'Ubuntu 24.04에서 실행하세요.' >&2; exit 1;
 }
 IMAGE_ROOT="${1:-$PWD/data/nuscenes}"
+if [[ ${REASONING_SOURCE:-original} != original && ${REPORT_PROFILE:-modified} != modified ]]; then
+  echo 'REASONING_SOURCE는 modified 실험에서만 지원합니다.' >&2; exit 2
+fi
 source scripts/hf_auth.sh
 require_hf_token
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -97,10 +100,23 @@ if [[ ${REPORT_PROFILE:-} == public_baseline ]]; then
 fi
 "$PYTHON" scripts/prepare_inputs.py --image_root "$IMAGE_ROOT" \
   --config "$RUN_CONFIG" --split_path "$RUN_DIR/split_manifest.json" --report_path "$RUN_DIR/input_repair_report.json"
+if [[ ${REASONING_SOURCE:-original} != original ]]; then
+  "$PYTHON" - "$REASONING_SOURCE" "$RUN_DIR" <<'PY'
+import json, shutil, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from generate_reasoning import load_rows
+from reasoning_source import load_reasoning_source
+source, run = Path(sys.argv[1]).resolve(), Path(sys.argv[2])
+load_reasoning_source(source, load_rows('data/drivelm.json'), json.loads((run/'split_manifest.json').read_text()))
+shutil.copyfile(source, run/'reasoning_overlay.json')
+PY
+  REASONING_SOURCE="$RUN_DIR/reasoning_overlay.json"
+fi
 COMMON=(--config "$RUN_CONFIG" --data_path data/drivelm.json
         --base_image_path "$IMAGE_ROOT" --split_path "$RUN_DIR/split_manifest.json"
-        --no-use_wandb --exact_output_dir)
-# One optimizer step = 12 microsteps. Failure stops the whole pipeline.
+        --no-use_wandb --exact_output_dir --reasoning_source "${REASONING_SOURCE:-original}")
+# One optimizer step with the selected batching. Failure stops the whole pipeline.
 "$PYTHON" scripts/vlm-finetuning.py "${COMMON[@]}" --mode reason --max_steps 1 --output_dir "$RUN_DIR/smoke"
 for MODE in simple reason; do
   "$PYTHON" scripts/vlm-finetuning.py "${COMMON[@]}" --mode "$MODE" --output_dir "$RUN_DIR/$MODE"

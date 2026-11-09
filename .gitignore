@@ -59,3 +59,34 @@ splits/
 
 # Generated Unsloth compilation cache
 unsloth_compiled_cache/
+
+# Isolated ablation artifacts and checkpoints
+outputs/ablation_study/
+
+# Local rationale generation outputs
+outputs/local_reasoning/
+
+# Generated experiment artifacts: keep code/configs/docs/tests in Git
+/outputs/
+/outputs_*/
+/checkpoints/
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.incomplete
+
+# Credentials and local environment overrides
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Temporary document renders (keep final reports)
+~$*.docx
+~$*.xlsx
+~$*.pptx
