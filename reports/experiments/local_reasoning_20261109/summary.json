@@ -1,0 +1,104 @@
+{
+  "rows": [
+    {
+      "model": "original_reason_b12",
+      "Accuracy": 0.2054794520547945,
+      "Bleu_1": 0.7480188053268059,
+      "Bleu_2": 0.684000832742491,
+      "Bleu_3": 0.6214049861057344,
+      "Bleu_4": 0.559548083328209,
+      "ROUGE_L": 0.7098984959919407,
+      "CIDEr": 0.2534752680906108,
+      "Match_noGPT": 0.012345678786008231,
+      "Final_noGPT": 0.2268849546888022,
+      "accuracy_denominator": 73,
+      "behavior_correct": 12,
+      "behavior_total": 70,
+      "stop_correct": 5,
+      "stop_total": 16,
+      "fixed_tag0_correct": 146,
+      "fixed_tag0_total": 205,
+      "valid_answers": 528,
+      "test_total": 528,
+      "train_count": 4218,
+      "batch_size": 12,
+      "gradient_accumulation_steps": 1,
+      "train_on_responses_only": true,
+      "finished_epoch": 3.0,
+      "selected_checkpoint": "checkpoint-1056"
+    },
+    {
+      "model": "local_reason_b12",
+      "Accuracy": 0.09859154929577464,
+      "Bleu_1": 0.7026117033141577,
+      "Bleu_2": 0.6424976075294316,
+      "Bleu_3": 0.5841499563423955,
+      "Bleu_4": 0.5280434203181412,
+      "ROUGE_L": 0.7008100488956259,
+      "CIDEr": 0.20946570231050238,
+      "Match_noGPT": 0.012345678786008231,
+      "Final_noGPT": 0.18543266391645072,
+      "accuracy_denominator": 71,
+      "behavior_correct": 6,
+      "behavior_total": 70,
+      "stop_correct": 0,
+      "stop_total": 16,
+      "fixed_tag0_correct": 140,
+      "fixed_tag0_total": 205,
+      "valid_answers": 528,
+      "test_total": 528,
+      "train_count": 4161,
+      "batch_size": 12,
+      "gradient_accumulation_steps": 1,
+      "train_on_responses_only": true,
+      "finished_epoch": 3.0,
+      "selected_checkpoint": "checkpoint-347"
+    }
+  ],
+  "notes": [
+    "Graph Accuracy의 채점 대상은 모델별로 다르므로 동일 행동 문항과 고정 tag0 결과도 함께 본다.",
+    "원본/로컬 추론 실험의 train 문항 수는 각각 4218/4161이다. 추론 교체만의 효과로 단정할 수 없다.",
+    "두 조건 모두 batch 12 × 누적 1, 응답만 학습, 최대 3 epochs이다. validation/test split은 동일하다.",
+    "원본 추론을 유지한 validation 전체 응답 loss로 체크포인트를 선택했다. 원본: checkpoint-1056, 로컬: checkpoint-347.",
+    "Match_noGPT와 Final_noGPT는 GPT 채점을 포함하는 논문 지표와 다르다. 단일 seed의 탐색적 비교다.",
+    "원본 QA·생성 전문·이미지·모델 가중치는 포함하지 않는다. 출처 경로는 로컬 재현용이며 해당 파일은 Git에서 제외된다."
+  ],
+  "sources": [
+    {
+      "path": "outputs/ablation_study/20261102_controlled/evaluations/reason_b12_response_test.json",
+      "sha256": "7dbf8bf3ddebad6a313acd11bff1d3766dd5475a710e74b91728a79e02fd0e7a"
+    },
+    {
+      "path": "outputs/ablation_study/20261102_controlled/models/reason_b12_response/training_config.json",
+      "sha256": "e98d45bb90dc39857179c7c078972133c67d5b620478f1c50bb3e562cded7d28"
+    },
+    {
+      "path": "outputs/ablation_study/20261102_controlled/models/reason_b12_response/completed.json",
+      "sha256": "dfeb46a2ec288dbe3d2688293ad6eb0953651e1d8fb243b0540f7a7114344f8d"
+    },
+    {
+      "path": "outputs/local_reasoning_experiments/Qwen2.5-VL-3B-Instruct-bnb-4bit_reason_drivelm_20261109_151821/reason.json",
+      "sha256": "58d39c63ca87dd73e0d46174616ee16963194a6f27363dc2888d80e0539131a7"
+    },
+    {
+      "path": "outputs/local_reasoning_experiments/Qwen2.5-VL-3B-Instruct-bnb-4bit_reason_drivelm_20261109_151821/training_config.json",
+      "sha256": "8690080c684537fdd569806be150fa4f89573fb25e5c22c5f8c7c27ab7893d7c"
+    },
+    {
+      "path": "outputs/local_reasoning_experiments/Qwen2.5-VL-3B-Instruct-bnb-4bit_reason_drivelm_20261109_151821/completed.json",
+      "sha256": "234dce8b94095a5204291881d7fdf4e6f95e0ec3030b4b57b5036568cbf5bd8b"
+    },
+    {
+      "path": "outputs/ablation_study/20261102_controlled/evaluations/reason_b12_response_test.json.metrics.json",
+      "sha256": "d00825702e7109dcf3ff1ae060e37a9e346fd7ed50ff076363f737cd82b40c04"
+    },
+    {
+      "path": "outputs/local_reasoning_experiments/Qwen2.5-VL-3B-Instruct-bnb-4bit_reason_drivelm_20261109_151821/comparison/comparison.json",
+      "sha256": "df47f99f23b377e99ab66bef5ad6db849c838c6fa2f5469dc7128d13aa910612"
+    },
+    {
+      "path": "outputs/local_reasoning_experiments/Qwen2.5-VL-3B-Instruct-bnb-4bit_reason_drivelm_20261109_151821/split_manifest.json",
+      "sha256": "82e50a7b14b8231dc65c262f3d5bbd7d3011f257b6f4a51a9d8205a0068c3490"
+    }
+  ]
+}
